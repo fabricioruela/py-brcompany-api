@@ -1,0 +1,22 @@
+services:
+  brcompany_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: brcompany_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DATABASE_URL: postgresql://br_company:br_company_secret@br_company_db:5432/br_company
+      APP_DB_SCHEMA: registry
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      APP_LOG_LEVEL: INFO
+      APP_CORS_ORIGINS: '["http://localhost:3000","http://localhost:5173"]'
+    networks:
+      - br_company_network
+
+networks:
+  br_company_network:
+    external: true
