@@ -22,6 +22,7 @@ deploy/
 ├── inventory.ini.example    # Modelo de inventário de hosts para Ansible
 ├── vars.yml.example         # Modelo de variáveis de configuração
 ├── py-brcompany-api.service # Unit de serviço do systemd (porta 8040)
+├── nginx.conf               # Configuração de Reverse Proxy Nginx para a API
 └── PLAYBOOK.md              # Este manual operacional
 ```
 

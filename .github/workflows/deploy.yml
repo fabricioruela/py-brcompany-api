@@ -63,6 +63,18 @@ jobs:
               echo "==> Serviço py-brcompany-api reiniciado com sucesso."
             fi
 
+            echo "==> Atualizando configuração do Nginx para a API se houver..."
+            if command -v nginx >/dev/null 2>&1 && [ -f /opt/py-brcompany-api/deploy/nginx.conf ]; then
+              if command -v sudo >/dev/null 2>&1; then
+                sudo cp /opt/py-brcompany-api/deploy/nginx.conf /etc/nginx/sites-available/py-brcompany-api 2>/dev/null || true
+                sudo ln -sf /etc/nginx/sites-available/py-brcompany-api /etc/nginx/sites-enabled/ 2>/dev/null || true
+                if sudo nginx -t >/dev/null 2>&1; then
+                  sudo systemctl reload nginx 2>/dev/null || true
+                  echo "==> Nginx recarregado com sucesso para a API."
+                fi
+              fi
+            fi
+
             echo "==> Validando status de saúde na porta 8040..."
             sleep 3
             curl -f http://127.0.0.1:8040/health || (echo "ERRO: Health check falhou!" && exit 1)

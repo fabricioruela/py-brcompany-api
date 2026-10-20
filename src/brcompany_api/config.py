@@ -29,6 +29,10 @@ class Settings(BaseSettings):
 
     # CORS settings
     app_cors_origins: List[str] = [
+        "http://brcompany.net.br",
+        "https://brcompany.net.br",
+        "http://www.brcompany.net.br",
+        "https://www.brcompany.net.br",
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
