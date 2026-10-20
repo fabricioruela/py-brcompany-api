@@ -5,11 +5,7 @@
 # 1. O arquivo `deploy/vars.yml` está no `.gitignore` e NÃO deve ser versionado no Git.
 # 2. Em produção, as credenciais e o `.env` são gravados FORA do repositório da aplicação
 #    (em /etc/py-brcompany-api/.env com permissão 0600), evitando exposição ou sobrescrita em git pulls.
-# 3. A senha do banco (db_password) pode ser omitida deste arquivo e fornecida de forma segura por:
-#    - Linha de comando: ansible-playbook -i inventory.ini playbook.yml -e "db_password=SENHA"
-#    - Prompt interativo: o playbook perguntará a senha no terminal sem exibi-la.
-#    - GitHub Secrets: ${{ secrets.DB_PASSWORD }} via GitHub Actions.
-#    - Criptografia: ansible-vault encrypt vars.yml
+# 3. A senha do banco (db_password) pode ser omitida deste arquivo e fornecida de forma segura via prompt ou GitHub Secrets.
 
 # 1. Usuário e Caminhos do Sistema Linux
 app_user: "usr_brcompany"
@@ -36,9 +32,18 @@ db_pool_min_size: 4
 db_pool_max_size: 20
 db_pool_timeout: 30.0
 
-# 4. Configurações do Servidor Web e API
+# 4. Configurações do Servidor Web e API FastAPI
 app_host: "0.0.0.0"
 app_port: 8040
 app_workers: 4
 app_log_level: "INFO"
-app_cors_origins: '["http://localhost:3000","http://localhost:5173","http://localhost"]'
+app_cors_origins: '["http://brcompany.net.br","https://brcompany.net.br","http://www.brcompany.net.br","https://www.brcompany.net.br","http://localhost:3000","http://localhost:5173","http://localhost"]'
+
+# 5. Configurações de Reverse Proxy Nginx
+# Como o domínio brcompany.net.br utiliza o Nginx do py-brcompany-web como gateway unificado
+# (que já redireciona /api/, /health e /docs para http://127.0.0.1:8040), mantemos use_nginx: false
+# para a API rodar exclusivamente sob o systemd sem criar conflitos na porta 80.
+use_nginx: false
+api_domain: "brcompany.net.br"
+nginx_api_port: 80
+nginx_site_name: "py-brcompany-api"

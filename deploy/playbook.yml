@@ -33,7 +33,11 @@
     app_port: 8040
     app_workers: 4
     app_log_level: "INFO"
-    app_cors_origins: '["http://localhost:3000","http://localhost:5173","http://localhost"]'
+    app_cors_origins: '["http://brcompany.net.br","https://brcompany.net.br","http://www.brcompany.net.br","https://www.brcompany.net.br","http://localhost:3000","http://localhost:5173","http://localhost"]'
+    use_nginx: false
+    api_domain: "_"
+    nginx_api_port: 80
+    nginx_site_name: "py-brcompany-api"
 
   pre_tasks:
     - name: Definir senha do banco a partir do prompt se informada
@@ -63,6 +67,7 @@
           - python3-pip
           - libpq-dev
           - postgresql-client
+          - nginx
           - acl
         state: present
 
@@ -99,7 +104,7 @@
         mode: '0600'
       ignore_errors: yes
 
-    - name: 3.3. Configurar permissão sudo restrita para gerenciamento do serviço systemd
+    - name: 3.3. Configurar permissão sudo restrita para gerenciamento dos serviços
       copy:
         dest: "/etc/sudoers.d/99-{{ app_user }}-api"
         mode: '0440'
@@ -107,6 +112,15 @@
         content: |
           {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/cp {{ app_dir }}/deploy/{{ service_name }}.service /etc/systemd/system/
           {{ app_user }} ALL=(ALL) NOPASSWD: /bin/cp {{ app_dir }}/deploy/{{ service_name }}.service /etc/systemd/system/
+          {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/cp {{ app_dir }}/deploy/nginx.conf /etc/nginx/sites-available/{{ nginx_site_name }}
+          {{ app_user }} ALL=(ALL) NOPASSWD: /bin/cp {{ app_dir }}/deploy/nginx.conf /etc/nginx/sites-available/{{ nginx_site_name }}
+          {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/ln -sf /etc/nginx/sites-available/{{ nginx_site_name }} /etc/nginx/sites-enabled/
+          {{ app_user }} ALL=(ALL) NOPASSWD: /bin/ln -sf /etc/nginx/sites-available/{{ nginx_site_name }} /etc/nginx/sites-enabled/
+          {{ app_user }} ALL=(ALL) NOPASSWD: /usr/sbin/nginx -t
+          {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload nginx
+          {{ app_user }} ALL=(ALL) NOPASSWD: /bin/systemctl reload nginx
+          {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx
+          {{ app_user }} ALL=(ALL) NOPASSWD: /bin/systemctl restart nginx
           {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
           {{ app_user }} ALL=(ALL) NOPASSWD: /bin/systemctl daemon-reload
           {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart {{ service_name }}
@@ -214,7 +228,35 @@
         enabled: yes
         state: started
 
-    - name: 14. Aguardar API responder no endpoint de saúde
+    - name: 14. Instalar configuração do virtual host no Nginx para a API
+      copy:
+        src: nginx.conf
+        dest: "/etc/nginx/sites-available/{{ nginx_site_name }}"
+        mode: '0644'
+      when: use_nginx | bool
+      notify:
+        - Testar e recarregar Nginx
+
+    - name: 15. Habilitar site da API no Nginx via symlink
+      file:
+        src: "/etc/nginx/sites-available/{{ nginx_site_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ nginx_site_name }}"
+        state: link
+      when: use_nginx | bool
+
+    - name: 16. Testar sintaxe do Nginx
+      command: nginx -t
+      changed_when: false
+      when: use_nginx | bool
+
+    - name: 17. Iniciar e habilitar o serviço Nginx
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+      when: use_nginx | bool
+
+    - name: 18. Aguardar API responder no endpoint de saúde interno (porta {{ app_port }})
       uri:
         url: "http://127.0.0.1:{{ app_port }}/health"
         status_code: [200, 503]
@@ -224,7 +266,7 @@
       delay: 5
       until: health_check_result.status is defined
 
-    - name: 15. Exibir resultado do diagnóstico de saúde da API
+    - name: 19. Exibir resultado do diagnóstico de saúde da API
       debug:
         msg: "Status da API na porta {{ app_port }}: {{ health_check_result.json | default(health_check_result.content) }}"
 
@@ -237,3 +279,6 @@
       systemd:
         name: "{{ service_name }}.service"
         state: restarted
+
+    - name: Testar e recarregar Nginx
+      shell: nginx -t && systemctl reload nginx
