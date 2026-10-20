@@ -33,15 +33,22 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          script_stop: true
-          script: |
+      - name: Deploy via Native SSH (OpenSSH)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          # 1. Preparar chave privada SSH com tratamento de quebras de linha
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+          echo "" >> ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # 2. Executar deploy remoto via OpenSSH nativo
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}" bash -e << 'EOF'
             echo "==> Iniciando publicação contínua do py-brcompany-api..."
             git config --global --add safe.directory /opt/py-brcompany-api 2>/dev/null || true
             cd /opt/py-brcompany-api
@@ -80,3 +87,4 @@ jobs:
             curl -f http://127.0.0.1:8040/health || (echo "ERRO: Health check falhou!" && exit 1)
 
             echo "==> Deploy da API concluído com sucesso!"
+          EOF
