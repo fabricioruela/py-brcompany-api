@@ -40,13 +40,15 @@ jobs:
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
         run: |
+          # 1. Preparar chave privada SSH com tratamento de quebras de linha
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          echo "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+          echo "" >> ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -p "${SSH_PORT}" -H "${SSH_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
 
-          ssh -i ~/.ssh/id_rsa -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}" bash -e << 'EOF'
+          # 2. Executar deploy remoto via OpenSSH nativo
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}" bash -e << 'EOF'
             echo "==> Iniciando publicação contínua do py-brcompany-api..."
             git config --global --add safe.directory /opt/py-brcompany-api 2>/dev/null || true
             cd /opt/py-brcompany-api
