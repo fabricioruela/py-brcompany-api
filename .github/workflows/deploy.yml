@@ -26,7 +26,7 @@ jobs:
 
       - name: Run unit test suite
         run: |
-          pytest -v
+          pytest -v -m "not integration"
 
   deploy:
     name: Deploy to Production Server

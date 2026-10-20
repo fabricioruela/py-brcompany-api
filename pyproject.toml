@@ -35,3 +35,6 @@ packages = ["src/brcompany_api"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+    "integration: Integration tests requiring a running PostgreSQL database with Receita Federal schema",
+]
