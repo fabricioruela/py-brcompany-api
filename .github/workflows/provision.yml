@@ -1,0 +1,45 @@
+name: Infra - Provision Initial API Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  provision:
+    name: Run Initial API Ansible Playbook
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ secrets.SSH_PORT || 22 }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Prepare Ansible Inventory and Vars
+        run: |
+          cat <<EOF > deploy/inventory.ini
+          [app_servers]
+          py-brcompany-api ansible_host=${{ secrets.SSH_HOST }} ansible_user=${{ secrets.SSH_USER }} ansible_port=${{ secrets.SSH_PORT || 22 }} ansible_ssh_private_key_file=~/.ssh/id_rsa
+          EOF
+
+          cat <<EOF > deploy/vars.yml
+          app_port: 8040
+          db_password: "${{ secrets.DB_PASSWORD || 'br_company_secret' }}"
+          app_repo_url: "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          EOF
+
+      - name: Run Playbook
+        run: |
+          cd deploy
+          ansible-playbook -i inventory.ini playbook.yml

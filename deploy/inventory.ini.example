@@ -1,0 +1,3 @@
+# Inventário de Exemplo para Produção (py-brcompany-api)
+[app_servers]
+py-brcompany-api ansible_host=SEU_IP_OU_HOST ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa

@@ -1,0 +1,44 @@
+---
+# Variáveis de Configuração para o Playbook de Produção (Ubuntu 26.04) — py-brcompany-api
+#
+# NOTA DE SEGURANÇA:
+# 1. O arquivo `deploy/vars.yml` está no `.gitignore` e NÃO deve ser versionado no Git.
+# 2. Em produção, as credenciais e o `.env` são gravados FORA do repositório da aplicação
+#    (em /etc/py-brcompany-api/.env com permissão 0600), evitando exposição ou sobrescrita em git pulls.
+# 3. A senha do banco (db_password) pode ser omitida deste arquivo e fornecida de forma segura por:
+#    - Linha de comando: ansible-playbook -i inventory.ini playbook.yml -e "db_password=SENHA"
+#    - Prompt interativo: o playbook perguntará a senha no terminal sem exibi-la.
+#    - GitHub Secrets: ${{ secrets.DB_PASSWORD }} via GitHub Actions.
+#    - Criptografia: ansible-vault encrypt vars.yml
+
+# 1. Usuário e Caminhos do Sistema Linux
+app_user: "usr_brcompany"
+app_group: "usr_brcompany"
+app_dir: "/opt/py-brcompany-api"
+
+# Diretório e arquivo de ambiente seguro fora do repositório
+env_dir: "/etc/py-brcompany-api"
+env_file_path: "/etc/py-brcompany-api/.env"
+app_environment: "production"
+
+# 2. Repositório Git da Aplicação
+app_repo_url: "https://github.com/fabricioruela/py-brcompany-api.git"
+app_repo_branch: "main"
+
+# 3. Configurações de Conexão com o Banco de Dados PostgreSQL
+db_host: "localhost"
+db_port: 5432
+db_name: "br_company"
+db_user: "app_br_company"
+# db_password: "" # Se omitido, o Ansible solicitará via prompt seguro ou aceitará via -e
+db_schema: "registry"
+db_pool_min_size: 4
+db_pool_max_size: 20
+db_pool_timeout: 30.0
+
+# 4. Configurações do Servidor Web e API
+app_host: "0.0.0.0"
+app_port: 8040
+app_workers: 4
+app_log_level: "INFO"
+app_cors_origins: '["http://localhost:3000","http://localhost:5173","http://localhost"]'

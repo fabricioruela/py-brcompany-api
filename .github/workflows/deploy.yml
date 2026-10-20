@@ -1,0 +1,70 @@
+name: CD - Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Tests Prior to Deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run unit test suite
+        run: |
+          pytest -v -m "not integration"
+
+  deploy:
+    name: Deploy to Production Server
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script_stop: true
+          script: |
+            echo "==> Iniciando publicação contínua do py-brcompany-api..."
+            git config --global --add safe.directory /opt/py-brcompany-api 2>/dev/null || true
+            cd /opt/py-brcompany-api
+
+            echo "==> Atualizando código a partir da branch main..."
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "==> Atualizando dependências no ambiente virtual..."
+            .venv/bin/pip install --upgrade pip setuptools wheel
+            .venv/bin/pip install -e .
+
+            echo "==> Atualizando unit do systemd se houver alterações..."
+            if command -v sudo >/dev/null 2>&1; then
+              sudo cp /opt/py-brcompany-api/deploy/py-brcompany-api.service /etc/systemd/system/ 2>/dev/null || true
+              sudo systemctl daemon-reload 2>/dev/null || true
+              sudo systemctl restart py-brcompany-api
+              echo "==> Serviço py-brcompany-api reiniciado com sucesso."
+            fi
+
+            echo "==> Validando status de saúde na porta 8040..."
+            sleep 3
+            curl -f http://127.0.0.1:8040/health || (echo "ERRO: Health check falhou!" && exit 1)
+
+            echo "==> Deploy da API concluído com sucesso!"

@@ -4,8 +4,27 @@ from decimal import Decimal
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import socket
+from urllib.parse import urlparse
+from brcompany_api.config import get_settings
 from brcompany_api.db import get_db_pool
 from brcompany_api.main import app
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def require_db():
+    """Skip integration tests immediately if PostgreSQL is not reachable (e.g. in CI)."""
+    cfg = get_settings()
+    parsed = urlparse(cfg.app_database_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 5432
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            pass
+    except OSError:
+        pytest.skip(f"PostgreSQL database is not reachable at {host}:{port}; skipping integration tests.")
 
 
 @pytest.fixture
