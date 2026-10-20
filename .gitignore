@@ -35,3 +35,6 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+
+deploy/vars.yml
+deploy/inventory.ini

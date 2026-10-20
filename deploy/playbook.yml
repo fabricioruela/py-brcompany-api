@@ -1,0 +1,226 @@
+---
+- name: Provisionamento e Publicação da API em Produção (Ubuntu 26.04)
+  hosts: app_servers
+  become: yes
+  vars_files:
+    - vars.yml
+  vars_prompt:
+    - name: db_password_prompt
+      prompt: "Informe a senha do banco PostgreSQL para app_br_company (deixe em branco se definida via vars.yml ou -e)"
+      private: yes
+      default: ""
+  vars:
+    # Valores padrão
+    app_user: "usr_brcompany"
+    app_group: "usr_brcompany"
+    app_dir: "/opt/py-brcompany-api"
+    service_name: "py-brcompany-api"
+    app_environment: "production"
+    env_dir: "/etc/py-brcompany-api"
+    env_file_path: "/etc/py-brcompany-api/.env"
+    app_repo_url: "https://github.com/fabricioruela/py-brcompany-api.git"
+    app_repo_branch: "main"
+    db_host: "localhost"
+    db_port: 5432
+    db_name: "br_company"
+    db_user: "app_br_company"
+    db_password: ""
+    db_schema: "registry"
+    db_pool_min_size: 4
+    db_pool_max_size: 20
+    db_pool_timeout: 30.0
+    app_host: "0.0.0.0"
+    app_port: 8040
+    app_workers: 4
+    app_log_level: "INFO"
+    app_cors_origins: '["http://localhost:3000","http://localhost:5173","http://localhost"]'
+
+  pre_tasks:
+    - name: Definir senha do banco a partir do prompt se informada
+      set_fact:
+        db_password: "{{ db_password_prompt }}"
+      when: db_password_prompt != ""
+
+    - name: Validar se a senha do banco foi informada
+      fail:
+        msg: "A senha do banco de dados (db_password) é obrigatória. Forneça através do prompt interativo, em vars.yml ou com -e 'db_password=SUA_SENHA'."
+      when: db_password is not defined or db_password == ""
+
+  tasks:
+    - name: 1. Atualizar cache do APT e instalar pacotes base
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        pkg:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - git
+          - build-essential
+          - python3
+          - python3-venv
+          - python3-pip
+          - libpq-dev
+          - postgresql-client
+          - acl
+        state: present
+
+    - name: 2. Criar grupo do sistema para a aplicação
+      group:
+        name: "{{ app_group }}"
+        state: present
+        system: yes
+
+    - name: 3. Criar usuário do sistema para a aplicação
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        home: "/home/{{ app_user }}"
+        shell: /bin/bash
+        system: yes
+        state: present
+
+    - name: 3.1. Garantir diretório .ssh para o usuário da aplicação
+      file:
+        path: "/home/{{ app_user }}/.ssh"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0700'
+
+    - name: 3.2. Copiar chaves SSH autorizadas para o usuário da aplicação se existirem
+      copy:
+        src: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        dest: "/home/{{ app_user }}/.ssh/authorized_keys"
+        remote_src: yes
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0600'
+      ignore_errors: yes
+
+    - name: 3.3. Configurar permissão sudo restrita para gerenciamento do serviço systemd
+      copy:
+        dest: "/etc/sudoers.d/99-{{ app_user }}-api"
+        content: |
+          {{ app_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload, /usr/bin/systemctl restart {{ service_name }}, /usr/bin/systemctl stop {{ service_name }}, /usr/bin/systemctl start {{ service_name }}, /usr/bin/systemctl status {{ service_name }}, /usr/bin/journalctl -u {{ service_name }}*
+        validate: 'visudo -cf %s'
+        mode: '0440'
+
+    - name: 4. Criar diretório base da aplicação
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+
+    - name: 4.1. Configurar safe.directory no git para o diretório da aplicação
+      command: git config --global --add safe.directory "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    - name: 5. Clonar ou atualizar repositório da aplicação
+      git:
+        repo: "{{ app_repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ app_repo_branch }}"
+        update: yes
+        force: yes
+      become_user: "{{ app_user }}"
+
+    - name: 5.1. Garantir propriedade de todo o repositório clonado
+      file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: yes
+
+    - name: 6. Criar ambiente virtual Python (.venv)
+      command: python3 -m venv "{{ app_dir }}/.venv"
+      args:
+        creates: "{{ app_dir }}/.venv/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: 7. Instalar dependências da aplicação no ambiente virtual
+      command: "{{ app_dir }}/.venv/bin/pip install --upgrade pip setuptools wheel"
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    - name: 8. Instalar pacote da aplicação no ambiente virtual
+      command: "{{ app_dir }}/.venv/bin/pip install -e ."
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      changed_when: true
+
+    - name: 9. Criar diretório seguro de configuração fora do projeto ({{ env_dir }})
+      file:
+        path: "{{ env_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0750'
+
+    - name: 10. Gerar arquivo de configuração .env fora do projeto com permissões restritas (0600)
+      copy:
+        dest: "{{ env_file_path }}"
+        content: |
+          # Arquivo gerado automaticamente via Ansible Playbook
+          APP_NAME=py-brcompany-api
+          APP_ENV={{ app_environment }}
+          APP_HOST={{ app_host }}
+          APP_PORT={{ app_port }}
+          APP_LOG_LEVEL={{ app_log_level }}
+          APP_DATABASE_URL=postgresql://{{ db_user }}:{{ db_password }}@{{ db_host }}:{{ db_port }}/{{ db_name }}
+          APP_DB_SCHEMA={{ db_schema }}
+          APP_DB_POOL_MIN_SIZE={{ db_pool_min_size }}
+          APP_DB_POOL_MAX_SIZE={{ db_pool_max_size }}
+          APP_DB_POOL_TIMEOUT={{ db_pool_timeout }}
+          APP_CORS_ORIGINS={{ app_cors_origins }}
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0600'
+
+    - name: 11. Instalar arquivo de serviço systemd ({{ service_name }}.service)
+      copy:
+        src: "{{ service_name }}.service"
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        mode: '0644'
+      notify:
+        - Recarregar daemons do systemd
+        - Reiniciar serviço py-brcompany-api
+
+    - name: 12. Recarregar daemons do systemd imediatamente
+      systemd:
+        daemon_reload: yes
+
+    - name: 13. Habilitar e iniciar serviço systemd ({{ service_name }}.service)
+      systemd:
+        name: "{{ service_name }}.service"
+        enabled: yes
+        state: started
+
+    - name: 14. Aguardar API responder no endpoint de saúde
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        status_code: [200, 503]
+        return_content: yes
+      register: health_check_result
+      retries: 6
+      delay: 5
+      until: health_check_result.status is defined
+
+    - name: 15. Exibir resultado do diagnóstico de saúde da API
+      debug:
+        msg: "Status da API na porta {{ app_port }}: {{ health_check_result.json | default(health_check_result.content) }}"
+
+  handlers:
+    - name: Recarregar daemons do systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Reiniciar serviço py-brcompany-api
+      systemd:
+        name: "{{ service_name }}.service"
+        state: restarted

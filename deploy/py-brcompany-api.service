@@ -1,0 +1,21 @@
+[Unit]
+Description=Receita Federal CNPJ FastAPI REST Service (py-brcompany-api)
+Documentation=https://github.com/fabricioruela/py-brcompany-api
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=usr_brcompany
+Group=usr_brcompany
+WorkingDirectory=/opt/py-brcompany-api
+EnvironmentFile=/etc/py-brcompany-api/.env
+ExecStart=/opt/py-brcompany-api/.venv/bin/uvicorn brcompany_api.main:app --host 0.0.0.0 --port 8040 --workers 4
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
