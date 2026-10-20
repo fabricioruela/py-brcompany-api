@@ -50,13 +50,8 @@ jobs:
           # 2. Executar deploy remoto via OpenSSH nativo
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}" bash -e << 'EOF'
             echo "==> Iniciando publicação contínua do py-brcompany-api..."
-            cd /opt/py-brcompany-api
-
-            echo "==> Ajustando permissões para o usuário de deploy..."
-            if command -v sudo >/dev/null 2>&1; then
-              sudo chown -R $(id -u):$(id -g) /opt/py-brcompany-api
-            fi
             git config --global --add safe.directory /opt/py-brcompany-api 2>/dev/null || true
+            cd /opt/py-brcompany-api
 
             echo "==> Atualizando código a partir da branch main..."
             git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
@@ -85,11 +80,6 @@ jobs:
                   echo "==> Nginx recarregado com sucesso para a API."
                 fi
               fi
-            fi
-
-            echo "==> Restaurando permissões de produção para usr_brcompany..."
-            if command -v sudo >/dev/null 2>&1; then
-              sudo chown -R usr_brcompany:usr_brcompany /opt/py-brcompany-api
             fi
 
             echo "==> Validando status de saúde na porta 8040..."
