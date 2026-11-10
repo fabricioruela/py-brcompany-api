@@ -72,13 +72,22 @@ async def get_db_conn() -> AsyncGenerator[psycopg.AsyncConnection, None]:
 async def check_db_health() -> dict:
     """Perform a lightweight ping to verify PostgreSQL connectivity."""
     start_time = time.perf_counter()
-    pool = get_db_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT 1 AS alive;")
-            row = await cur.fetchone()
-            latency_ms = (time.perf_counter() - start_time) * 1000
-            return {
-                "status": "healthy" if row and row.get("alive") == 1 else "unhealthy",
-                "latency_ms": round(latency_ms, 2),
-            }
+    try:
+        pool = get_db_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1 AS alive;")
+                row = await cur.fetchone()
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                return {
+                    "status": "healthy" if row and row.get("alive") == 1 else "unhealthy",
+                    "latency_ms": round(latency_ms, 2),
+                }
+    except Exception as exc:
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        logger.error("Database health check failed: %s", exc)
+        return {
+            "status": "unhealthy",
+            "latency_ms": round(latency_ms, 2),
+            "error": str(exc),
+        }

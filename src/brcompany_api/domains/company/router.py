@@ -1,5 +1,6 @@
 """FastAPI router for company and establishment endpoints."""
 
+import asyncio
 from typing import Annotated
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -40,8 +41,11 @@ async def list_branches(
                 detail="CNPJ base must contain 8 digits",
             )
 
-    total = await service.count_branches(conn, cleaned)
-    branch_rows = await service.get_branches_by_base(conn, cleaned, limit=limit, offset=offset)
+    async with service.maybe_pipeline(conn):
+        total, branch_rows = await asyncio.gather(
+            service.count_branches(conn, cleaned),
+            service.get_branches_by_base(conn, cleaned, limit=limit, offset=offset),
+        )
 
     return BranchListResponse(
         cnpj_base=cleaned,
