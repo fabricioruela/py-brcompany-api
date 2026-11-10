@@ -183,6 +183,8 @@ class CompanyProfileResponse(BaseModel):
     secondary_cnaes_details: List[CnaeItem] = Field(default_factory=list)
     partners: List[PartnerItem] = Field(default_factory=list)
     total_branches: int = 1
+    contacts_locked: bool = False
+    credits_charged: int = 0
 
 
 class BranchListResponse(BaseModel):

@@ -1,4 +1,4 @@
-"""Main FastAPI application module."""
+"""Main FastAPI application module for PanoramaPJ (py-brcompany-api)."""
 
 from contextlib import asynccontextmanager
 import logging
@@ -10,8 +10,15 @@ import uvicorn
 
 from brcompany_api.config import get_settings
 from brcompany_api.db import check_db_health, close_db_pool, init_db_pool
+from brcompany_api.domains.admin.router import router as admin_router
+from brcompany_api.domains.auth.router import router as auth_router
+from brcompany_api.domains.billing.router import router as billing_router
 from brcompany_api.domains.company.router import router as company_router
+from brcompany_api.domains.export.router import router as export_router
 from brcompany_api.domains.metadata.router import router as metadata_router
+from brcompany_api.domains.privacy.router import router as privacy_router
+from brcompany_api.domains.radars.router import router as radars_router
+from brcompany_api.domains.search.router import router as search_router
 
 settings = get_settings()
 
@@ -25,16 +32,19 @@ logger = logging.getLogger("brcompany_api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown lifecycle for connection pools."""
-    logger.info("Starting up py-brcompany-api (%s)...", settings.app_env)
+    logger.info("Starting up %s (%s)...", settings.app_name, settings.app_env)
     await init_db_pool(settings)
     yield
-    logger.info("Shutting down py-brcompany-api...")
+    logger.info("Shutting down %s...", settings.app_name)
     await close_db_pool()
 
 
 app = FastAPI(
     title="py-brcompany-api",
-    description="High-performance async REST API providing access to Brazilian Receita Federal CNPJ registry data.",
+    description=(
+        "PanoramaPJ — Plataforma SaaS/DaaS de Inteligência de Mercado B2B, Consulta de CNPJ, "
+        "Enriquecimento Cadastral, Exportação de Leads e Prospecção."
+    ),
     version=settings.app_version,
     lifespan=lifespan,
     docs_url="/docs",
@@ -49,6 +59,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Process-Time-Ms", "X-Export-List-Id", "Content-Disposition"],
 )
 
 
@@ -82,6 +93,13 @@ async def health_check():
 
 
 # Register API v1 routers
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(admin_router, prefix="/api/v1")
+app.include_router(search_router, prefix="/api/v1")
+app.include_router(export_router, prefix="/api/v1")
+app.include_router(billing_router, prefix="/api/v1")
+app.include_router(radars_router, prefix="/api/v1")
+app.include_router(privacy_router, prefix="/api/v1")
 app.include_router(company_router, prefix="/api/v1")
 app.include_router(metadata_router, prefix="/api/v1")
 

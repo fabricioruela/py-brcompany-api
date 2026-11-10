@@ -28,7 +28,7 @@ async def init_db_pool(settings: Optional[Settings] = None) -> AsyncConnectionPo
         cfg.app_db_pool_max_size,
     )
 
-    options = f"-c search_path={cfg.app_db_schema},public"
+    options = f"-c search_path={cfg.app_db_schema},{cfg.app_saas_schema},public"
     _pool = AsyncConnectionPool(
         conninfo=cfg.app_database_url,
         min_size=cfg.app_db_pool_min_size,
@@ -41,6 +41,12 @@ async def init_db_pool(settings: Optional[Settings] = None) -> AsyncConnectionPo
         open=False,
     )
     await _pool.open()
+    try:
+        from brcompany_api.migrations import apply_saas_migrations
+        async with _pool.connection() as conn:
+            await apply_saas_migrations(conn)
+    except Exception as exc:
+        logger.warning("Could not auto-apply app_saas migrations on startup: %s", exc)
     logger.info("PostgreSQL connection pool initialized and opened successfully")
     return _pool
 

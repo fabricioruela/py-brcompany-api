@@ -17,6 +17,12 @@ class DomainListResponse(BaseModel):
     items: List[DomainItem]
 
 
+class LocationHierarchyResponse(BaseModel):
+    states: List[str] = []
+    municipalities: List[DomainItem] = []
+    neighborhoods: List[str] = []
+
+
 class EtlStatusResponse(BaseModel):
     current_schema: str
     last_published_month: Optional[str] = None

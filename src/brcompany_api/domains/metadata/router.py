@@ -11,9 +11,33 @@ from brcompany_api.domains.metadata.schemas import (
     DomainItem,
     DomainListResponse,
     EtlStatusResponse,
+    LocationHierarchyResponse,
 )
 
 router = APIRouter(tags=["Metadata & Domains"])
+
+
+@router.get(
+    "/domains/locations",
+    response_model=LocationHierarchyResponse,
+    summary="Cascade Lookup UF -> Municipality -> Neighborhood",
+    description="Retrieve Brazilian states (UF), municipalities filtered by state, and neighborhoods filtered by state + municipality.",
+)
+async def list_locations_cascade(
+    conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
+    state: Annotated[Optional[str], Query(description="2-letter UF state code (e.g. SP)")] = None,
+    municipality_code: Annotated[Optional[str], Query(description="4-digit municipality code")] = None,
+    q: Annotated[Optional[str], Query(description="Optional municipality name search")] = None,
+    limit: Annotated[int, Query(ge=1, le=2000)] = 1000,
+):
+    data = await service.get_locations_cascade(
+        conn, state=state, municipality_code=municipality_code, q=q, limit=limit
+    )
+    return LocationHierarchyResponse(
+        states=data["states"],
+        municipalities=[DomainItem.model_validate(m) for m in data["municipalities"]],
+        neighborhoods=data["neighborhoods"],
+    )
 
 
 @router.get(
