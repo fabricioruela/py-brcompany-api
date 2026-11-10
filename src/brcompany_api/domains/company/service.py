@@ -1,5 +1,7 @@
 """Database queries and business logic for Company and Establishment domain."""
 
+import asyncio
+from contextlib import asynccontextmanager
 import logging
 from typing import List, Optional
 import psycopg
@@ -232,6 +234,16 @@ async def get_branches_by_base(
         return await cur.fetchall()
 
 
+@asynccontextmanager
+async def maybe_pipeline(conn: psycopg.AsyncConnection):
+    """Enter psycopg pipeline mode when supported by a live AsyncConnection."""
+    if isinstance(conn, psycopg.AsyncConnection) and psycopg.Pipeline.is_supported():
+        async with conn.pipeline():
+            yield
+    else:
+        yield
+
+
 async def get_company_profile(
     conn: psycopg.AsyncConnection, raw_cnpj: str
 ) -> Optional[CompanyProfileResponse]:
@@ -243,28 +255,38 @@ async def get_company_profile(
         if not est_data:
             return None
         cnpj_base = est_data["cnpj_base"]
+        secondary_cnaes = est_data.get("secondary_cnaes") or []
+
+        async with maybe_pipeline(conn):
+            company_data, partners_data, total_branches, cnae_details = await asyncio.gather(
+                get_company_by_base(conn, cnpj_base),
+                get_partners_by_base(conn, cnpj_base),
+                count_branches(conn, cnpj_base),
+                get_cnaes_descriptions(conn, secondary_cnaes),
+            )
     elif len(clean) == 8:
         cnpj_base = clean
-        est_data = await get_headquarter_or_first_establishment(conn, cnpj_base)
+        async with maybe_pipeline(conn):
+            est_data, company_data, partners_data, total_branches = await asyncio.gather(
+                get_headquarter_or_first_establishment(conn, cnpj_base),
+                get_company_by_base(conn, cnpj_base),
+                get_partners_by_base(conn, cnpj_base),
+                count_branches(conn, cnpj_base),
+            )
         if not est_data:
             return None
+
+        secondary_cnaes = est_data.get("secondary_cnaes") or []
+        cnae_details = await get_cnaes_descriptions(conn, secondary_cnaes)
     else:
         return None
 
-    company_data = await get_company_by_base(conn, cnpj_base)
     if not company_data:
         # Construct fallback minimal company data if establishment exists
         company_data = {
             "cnpj_base": cnpj_base,
             "legal_name": est_data.get("trade_name") or "Razão Social não informada",
         }
-
-    partners_data = await get_partners_by_base(conn, cnpj_base)
-    total_branches = await count_branches(conn, cnpj_base)
-
-    # Resolve secondary CNAEs details if present
-    secondary_cnaes = est_data.get("secondary_cnaes") or []
-    cnae_details = await get_cnaes_descriptions(conn, secondary_cnaes)
 
     return CompanyProfileResponse(
         company=CompanyBaseInfo.model_validate(company_data),

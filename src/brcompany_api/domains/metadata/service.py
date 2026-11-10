@@ -2,6 +2,7 @@
 
 from typing import List, Optional
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 
 
@@ -57,6 +58,32 @@ async def get_legal_natures(conn: psycopg.AsyncConnection) -> List[dict]:
         return await cur.fetchall()
 
 
+async def _get_table_row_count(
+    conn: psycopg.AsyncConnection, schema: str, table: str
+) -> int:
+    """Retrieve fast row count estimate from pg_class, falling back to exact COUNT(*) when unanalyzed."""
+    estimate_query = """
+        SELECT c.reltuples::bigint AS estimate
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %(schema)s AND c.relname = %(table)s
+        LIMIT 1;
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(estimate_query, {"schema": schema, "table": table})
+        row = await cur.fetchone()
+        if row and row["estimate"] is not None and row["estimate"] > 0:
+            return int(row["estimate"])
+
+        exact_query = sql.SQL("SELECT count(*) AS total FROM {}.{};").format(
+            sql.Identifier(schema),
+            sql.Identifier(table),
+        )
+        await cur.execute(exact_query)
+        exact_row = await cur.fetchone()
+        return int(exact_row["total"]) if exact_row else 0
+
+
 async def get_etl_status(conn: psycopg.AsyncConnection, schema: str) -> dict:
     """Retrieve latest published ETL load run metadata and table metrics."""
     load_run_query = """
@@ -75,20 +102,16 @@ async def get_etl_status(conn: psycopg.AsyncConnection, schema: str) -> dict:
         await cur.execute(load_run_query)
         run = await cur.fetchone()
 
-        # Get counts from active schema
-        await cur.execute(f"SELECT count(*) AS total FROM {schema}.company;")
-        comp_row = await cur.fetchone()
+    total_companies = await _get_table_row_count(conn, schema, "company")
+    total_establishments = await _get_table_row_count(conn, schema, "establishment")
 
-        await cur.execute(f"SELECT count(*) AS total FROM {schema}.establishment;")
-        est_row = await cur.fetchone()
-
-        return {
-            "current_schema": schema,
-            "last_published_month": run["month"] if run else None,
-            "publish_mode": run["publish_mode"] if run else None,
-            "status": run["status"] if run else "none",
-            "started_at": run["started_at"] if run else None,
-            "finished_at": run["finished_at"] if run else None,
-            "total_companies": comp_row["total"] if comp_row else 0,
-            "total_establishments": est_row["total"] if est_row else 0,
-        }
+    return {
+        "current_schema": schema,
+        "last_published_month": run["month"] if run else None,
+        "publish_mode": run["publish_mode"] if run else None,
+        "status": run["status"] if run else "none",
+        "started_at": run["started_at"] if run else None,
+        "finished_at": run["finished_at"] if run else None,
+        "total_companies": total_companies,
+        "total_establishments": total_establishments,
+    }

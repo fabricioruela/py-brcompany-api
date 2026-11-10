@@ -99,3 +99,15 @@ async def test_openapi_docs(unit_client: AsyncClient):
     assert res_openapi.status_code == 200
     spec = res_openapi.json()
     assert spec["info"]["title"] == "py-brcompany-api"
+
+
+@pytest.mark.asyncio
+async def test_check_db_health_exception_handling(unit_client: AsyncClient):
+    """Test that check_db_health catches database pool exceptions and returns 503 degraded."""
+    with patch("brcompany_api.db.get_db_pool", side_effect=RuntimeError("Pool not initialized")):
+        response = await unit_client.get("/health")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "degraded"
+        assert data["database"]["status"] == "unhealthy"
+        assert "Pool not initialized" in data["database"]["error"]

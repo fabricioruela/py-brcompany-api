@@ -70,15 +70,19 @@ jobs:
               echo "==> Serviço py-brcompany-api reiniciado com sucesso."
             fi
 
-            echo "==> Atualizando configuração do Nginx para a API se houver..."
+            echo "==> Atualizando configuração do Nginx para a API (se habilitado)..."
             if command -v nginx >/dev/null 2>&1 && [ -f /opt/py-brcompany-api/deploy/nginx.conf ]; then
-              if command -v sudo >/dev/null 2>&1; then
-                sudo cp /opt/py-brcompany-api/deploy/nginx.conf /etc/nginx/sites-available/py-brcompany-api 2>/dev/null || true
-                sudo ln -sf /etc/nginx/sites-available/py-brcompany-api /etc/nginx/sites-enabled/ 2>/dev/null || true
-                if sudo nginx -t >/dev/null 2>&1; then
-                  sudo systemctl reload nginx 2>/dev/null || true
-                  echo "==> Nginx recarregado com sucesso para a API."
+              if [ -e /etc/nginx/sites-enabled/py-brcompany-api ] || [ "${USE_NGINX:-false}" = "true" ]; then
+                if command -v sudo >/dev/null 2>&1; then
+                  sudo cp /opt/py-brcompany-api/deploy/nginx.conf /etc/nginx/sites-available/py-brcompany-api 2>/dev/null || true
+                  sudo ln -sf /etc/nginx/sites-available/py-brcompany-api /etc/nginx/sites-enabled/ 2>/dev/null || true
+                  if sudo nginx -t >/dev/null 2>&1; then
+                    sudo systemctl reload nginx 2>/dev/null || true
+                    echo "==> Nginx recarregado com sucesso para a API."
+                  fi
                 fi
+              else
+                echo "==> Site py-brcompany-api não está habilitado no Nginx; ignorando atualização de vhost."
               fi
             fi
 
