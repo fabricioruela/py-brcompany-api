@@ -58,6 +58,88 @@ async def get_legal_natures(conn: psycopg.AsyncConnection) -> List[dict]:
         return await cur.fetchall()
 
 
+BRAZIL_STATES = [
+    "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA",
+    "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN",
+    "RO", "RR", "RS", "SC", "SE", "SP", "TO",
+]
+
+
+async def get_locations_cascade(
+    conn: psycopg.AsyncConnection,
+    state: Optional[str] = None,
+    municipality_code: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 1000,
+) -> dict:
+    """Retrieve UF -> Municipality -> Neighborhood cascade from location_hierarchy (with fallback)."""
+    clean_state = state.strip().upper()[:2] if state and state.strip() else None
+    clean_mun = municipality_code.strip()[:4] if municipality_code and municipality_code.strip() else None
+
+    municipalities: List[dict] = []
+    neighborhoods: List[str] = []
+
+    try:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("SELECT 1 FROM location_hierarchy LIMIT 1;")
+            has_hierarchy = (await cur.fetchone()) is not None
+
+            if has_hierarchy and clean_state:
+                if q and q.strip():
+                    await cur.execute(
+                        """
+                        SELECT municipality_code AS code, MAX(municipality_name) AS description
+                        FROM location_hierarchy
+                        WHERE state = %(state)s
+                          AND municipality_name ILIKE %(q)s
+                        GROUP BY municipality_code
+                        ORDER BY MAX(municipality_name) ASC
+                        LIMIT %(limit)s;
+                        """,
+                        {"state": clean_state, "q": f"%{q.strip()}%", "limit": limit},
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT municipality_code AS code, MAX(municipality_name) AS description
+                        FROM location_hierarchy
+                        WHERE state = %(state)s
+                        GROUP BY municipality_code
+                        ORDER BY MAX(municipality_name) ASC
+                        LIMIT %(limit)s;
+                        """,
+                        {"state": clean_state, "limit": limit},
+                    )
+                municipalities = await cur.fetchall()
+
+                if clean_mun:
+                    await cur.execute(
+                        """
+                        SELECT neighborhood
+                        FROM location_hierarchy
+                        WHERE state = %(state)s
+                          AND municipality_code = %(mun)s
+                          AND neighborhood <> ''
+                        ORDER BY neighborhood ASC
+                        LIMIT %(limit)s;
+                        """,
+                        {"state": clean_state, "mun": clean_mun, "limit": limit},
+                    )
+                    neighborhoods = [r["neighborhood"] for r in await cur.fetchall() if r.get("neighborhood")]
+            elif clean_state:
+                municipalities = await get_municipalities(conn, q=q, limit=limit)
+    except Exception:
+        await conn.rollback()
+        if clean_state:
+            municipalities = await get_municipalities(conn, q=q, limit=limit)
+
+    return {
+        "states": BRAZIL_STATES,
+        "municipalities": municipalities,
+        "neighborhoods": neighborhoods,
+    }
+
+
 async def _get_table_row_count(
     conn: psycopg.AsyncConnection, schema: str, table: str
 ) -> int:
