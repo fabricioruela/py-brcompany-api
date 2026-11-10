@@ -238,7 +238,7 @@ def test_search_filter_where_clause_builder():
     assert "csi.search_text ILIKE %(q_like)s" in where_sql
     assert "csi.state = ANY(%(states)s)" in where_sql
     assert "csi.municipality_code = ANY(%(municipality_codes)s)" in where_sql
-    assert "csi.secondary_cnaes && %(main_cnaes)s::char(7)[]" in where_sql
+    assert "csi.secondary_cnaes::text[] && %(main_cnaes)s::text[]" in where_sql
     assert "csi.has_phone = true" in where_sql
     assert "csi.has_email = true" in where_sql
     assert "company_opt_outs" in where_sql
