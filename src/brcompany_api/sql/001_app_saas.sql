@@ -203,3 +203,23 @@ CREATE TABLE IF NOT EXISTS app_saas.company_opt_outs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_saas_opt_outs_status ON app_saas.company_opt_outs (status);
+
+-- 15. Geo Coordinate Cache (bridging registry establishments and br_company.geo)
+CREATE TABLE IF NOT EXISTS app_saas.company_geo_cache (
+    cnpj CHAR(14) PRIMARY KEY,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    precision VARCHAR(32) NOT NULL CHECK (precision IN ('exact_number', 'street', 'cep_centroid', 'city_centroid')),
+    postal_code VARCHAR(16),
+    resolved_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS app_saas.geo_postcode_cache (
+    region VARCHAR(10) NOT NULL,
+    postcode_digits VARCHAR(8) NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    point_count INTEGER NOT NULL DEFAULT 1,
+    resolved_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (region, postcode_digits)
+);

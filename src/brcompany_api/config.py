@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     app_export_storage_dir: Path = Path("data/exports")
     app_export_retention_days: int = 30
 
+    # Search Cache settings
+    app_search_cache_ttl_seconds: int = 300
+    app_search_cache_max_entries: int = 128
+
     # Asaas Payment Gateway settings
     app_asaas_api_url: str = "https://sandbox.asaas.com/api/v3"
     app_asaas_api_key: str = ""

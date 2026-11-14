@@ -12,6 +12,7 @@ from brcompany_api.domains.metadata.schemas import (
     DomainListResponse,
     EtlStatusResponse,
     LocationHierarchyResponse,
+    ReverseGeocodeResponse,
 )
 
 router = APIRouter(tags=["Metadata & Domains"])
@@ -90,6 +91,21 @@ async def list_legal_natures(
         total=len(rows),
         items=[DomainItem.model_validate(r) for r in rows],
     )
+
+
+@router.get(
+    "/domains/location/reverse",
+    response_model=ReverseGeocodeResponse,
+    summary="Resolve UF and Municipality from Browser Coordinates",
+    description="Performs PostGIS reverse geocoding against geo.addresses to resolve UF and 4-digit RFB municipality code.",
+)
+async def reverse_geocode_location(
+    conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
+    lat: Annotated[float, Query(ge=-90.0, le=90.0, description="Latitude from browser geolocation")],
+    lon: Annotated[float, Query(ge=-180.0, le=180.0, description="Longitude from browser geolocation")],
+):
+    resolved = await service.reverse_geocode_coordinates(conn, lat, lon)
+    return ReverseGeocodeResponse.model_validate(resolved)
 
 
 @router.get(

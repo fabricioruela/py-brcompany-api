@@ -15,9 +15,11 @@ from brcompany_api.domains.company.schemas import (
     BranchListResponse,
     CompanyProfileResponse,
     EstablishmentSummary,
+    GeoCoordinate,
     PartnerItem,
     PartnerListResponse,
 )
+from brcompany_api.domains.geo import service as geo_service
 from brcompany_api.domains.privacy.router import is_cnpj_opted_out
 from brcompany_api.utils.cnpj import clean_cnpj, validate_cnpj
 from brcompany_api.utils.masking import mask_cpf_or_tax_id, mask_email, mask_phone, mask_street
@@ -78,10 +80,21 @@ async def list_branches(
             service.get_branches_by_base(conn, cleaned, limit=limit, offset=offset),
         )
 
+    geo_by_cnpj = await geo_service.resolve_establishments_geo_batch(
+        conn, branch_rows, mask_mei_exact=True
+    )
+    branches_out = []
+    for b in branch_rows:
+        item = EstablishmentSummary.model_validate(b)
+        g = geo_by_cnpj.get(item.cnpj)
+        if g:
+            item.geo = GeoCoordinate.model_validate(g)
+        branches_out.append(item)
+
     return BranchListResponse(
         cnpj_base=cleaned,
         total=total,
-        branches=[EstablishmentSummary.model_validate(b) for b in branch_rows],
+        branches=branches_out,
     )
 
 
@@ -184,6 +197,11 @@ async def get_company(
         if already_unlocked and dedup_enabled:
             profile.contacts_locked = False
             profile.credits_charged = 0
+            coord = await geo_service.resolve_establishment_geo(
+                conn, profile.establishment.model_dump(), mask_exact=False
+            )
+            if coord:
+                profile.establishment.geo = GeoCoordinate.model_validate(coord)
             return profile
 
         if is_api_key or unlock:
@@ -205,6 +223,18 @@ async def get_company(
             await conn.commit()
             profile.contacts_locked = False
             profile.credits_charged = 1
+            coord = await geo_service.resolve_establishment_geo(
+                conn, profile.establishment.model_dump(), mask_exact=False
+            )
+            if coord:
+                profile.establishment.geo = GeoCoordinate.model_validate(coord)
             return profile
 
+    coord = await geo_service.resolve_establishment_geo(
+        conn,
+        profile.establishment.model_dump(),
+        mask_exact=bool(profile.company.is_mei_optant),
+    )
+    if coord:
+        profile.establishment.geo = GeoCoordinate.model_validate(coord)
     return _apply_contact_and_lgpd_masking(profile)

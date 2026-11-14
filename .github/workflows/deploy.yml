@@ -87,8 +87,21 @@ jobs:
             fi
 
             echo "==> Validando status de saúde na porta 8040..."
-            sleep 3
-            curl -f http://127.0.0.1:8040/health || (echo "ERRO: Health check falhou!" && exit 1)
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8040/health; then
+                echo ""
+                echo "==> Health check OK após ${i} tentativa(s)."
+                HEALTH_OK=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${HEALTH_OK:-0}" != "1" ]; then
+              echo "ERRO: Health check falhou! Status e logs do serviço:"
+              sudo systemctl status py-brcompany-api --no-pager -l 2>&1 | tail -n 30 || true
+              sudo journalctl -u py-brcompany-api -n 80 --no-pager 2>&1 || true
+              exit 1
+            fi
 
             echo "==> Deploy da API concluído com sucesso!"
           EOF

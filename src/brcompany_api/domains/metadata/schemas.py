@@ -23,6 +23,14 @@ class LocationHierarchyResponse(BaseModel):
     neighborhoods: List[str] = []
 
 
+class ReverseGeocodeResponse(BaseModel):
+    detected: bool = False
+    state: Optional[str] = None
+    municipality_code: Optional[str] = None
+    municipality_name: Optional[str] = None
+    source: str = "unavailable"
+
+
 class EtlStatusResponse(BaseModel):
     current_schema: str
     last_published_month: Optional[str] = None

@@ -259,3 +259,259 @@ async def test_checkout_plans_and_admin_protection(unit_client: AsyncClient):
     res_admin = await unit_client.get("/api/v1/admin/settings")
     assert res_admin.status_code == 401
 
+
+def test_geo_place_name_normalization():
+    """Verify accent-free uppercase normalization for RFB municipality matching."""
+    from brcompany_api.utils.geo import BRAZIL_STATES, normalize_place_name
+
+    assert "SP" in BRAZIL_STATES
+    assert len(BRAZIL_STATES) == 27
+    assert normalize_place_name("  São   Paulo ") == "SAO PAULO"
+    assert normalize_place_name("Florianópolis") == "FLORIANOPOLIS"
+    assert normalize_place_name("Brasília") == "BRASILIA"
+
+
+@pytest.mark.asyncio
+async def test_reverse_geocode_endpoint_and_service(unit_client: AsyncClient):
+    """Verify /api/v1/domains/location/reverse validation and geo.addresses resolution."""
+    from unittest.mock import MagicMock
+    from brcompany_api.domains.metadata.service import reverse_geocode_coordinates
+
+    # Out-of-range coordinates rejected with 422
+    res_bad = await unit_client.get("/api/v1/domains/location/reverse?lat=99&lon=-46.6")
+    assert res_bad.status_code == 422
+
+    with patch(
+        "brcompany_api.domains.metadata.service.reverse_geocode_coordinates",
+        new_callable=AsyncMock,
+        return_value={
+            "detected": True,
+            "state": "SP",
+            "municipality_code": "7107",
+            "municipality_name": "SAO PAULO",
+            "source": "geo_addresses_city",
+        },
+    ) as mock_rev:
+        res = await unit_client.get("/api/v1/domains/location/reverse?lat=-23.5505&lon=-46.6333")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["detected"] is True
+        assert body["state"] == "SP"
+        assert body["municipality_code"] == "7107"
+        assert body["source"] == "geo_addresses_city"
+        mock_rev.assert_awaited_once()
+
+    # Test real reverse_geocode_coordinates matching logic directly
+    mock_rows = [
+        {"municipality_code": "6291", "municipality_name": "CAMPINAS"},
+        {"municipality_code": "7107", "municipality_name": "SAO PAULO"},
+    ]
+    fake_cur = AsyncMock()
+    fake_cur.fetchall.return_value = mock_rows
+    fake_cur_ctx = AsyncMock()
+    fake_cur_ctx.__aenter__.return_value = fake_cur
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur_ctx
+
+    with patch(
+        "brcompany_api.domains.metadata.service._lookup_nearest_geo_address",
+        new_callable=AsyncMock,
+        return_value={"region": "SP", "city": "São Paulo"},
+    ):
+        resolved_city = await reverse_geocode_coordinates(fake_conn, -23.5505, -46.6333)
+        assert resolved_city["source"] == "geo_addresses_city"
+        assert resolved_city["municipality_code"] == "7107"
+
+    with patch(
+        "brcompany_api.domains.metadata.service._lookup_nearest_geo_address",
+        new_callable=AsyncMock,
+        return_value={"region": "SP", "city": "Cidade Inexistente"},
+    ):
+        resolved_state_only = await reverse_geocode_coordinates(fake_conn, -23.5505, -46.6333)
+        assert resolved_state_only["source"] == "geo_addresses_state"
+        assert resolved_state_only["state"] == "SP"
+        assert resolved_state_only["municipality_code"] is None
+
+    with patch(
+        "brcompany_api.domains.metadata.service._lookup_nearest_geo_address",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        resolved_none = await reverse_geocode_coordinates(fake_conn, 40.7128, -74.0060)
+        assert resolved_none["detected"] is False
+        assert resolved_none["source"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_search_filter_classification_and_cache(unit_client: AsyncClient):
+    """Verify filter classification helpers and TTL+epoch search preview cache."""
+    from brcompany_api.domains.search.schemas import MaskedCompanyPreviewItem, SearchFilterRequest
+    from brcompany_api.domains.search.service import (
+        get_cached_preview,
+        invalidate_search_cache,
+        is_location_only_search,
+        is_unfiltered_search,
+    )
+
+    assert is_unfiltered_search(SearchFilterRequest()) is True
+    assert is_unfiltered_search(SearchFilterRequest(states=[" "])) is True
+    assert is_unfiltered_search(SearchFilterRequest(states=["SP"])) is False
+
+    assert is_location_only_search(SearchFilterRequest(states=["SP"])) is True
+    assert is_location_only_search(SearchFilterRequest(states=["SP"], municipality_codes=["7107"])) is True
+    assert is_location_only_search(SearchFilterRequest(states=["SP"], main_cnaes=["6201501"])) is False
+    assert is_location_only_search(SearchFilterRequest()) is False
+
+    invalidate_search_cache()
+    sample_item = MaskedCompanyPreviewItem(
+        cnpj="00000000000191",
+        cnpj_base="00000000",
+        legal_name="EMPRESA TESTE LTDA",
+    )
+    fake_conn = AsyncMock()
+
+    with patch("brcompany_api.domains.search.service.get_search_cache_epoch", new_callable=AsyncMock, return_value="24:0:"), \
+         patch("brcompany_api.domains.search.service.count_matching_companies", new_callable=AsyncMock, return_value=100) as mock_count, \
+         patch("brcompany_api.domains.search.service.preview_matching_companies", new_callable=AsyncMock, return_value=[sample_item]) as mock_prev:
+        f = SearchFilterRequest(states=["SP"], municipality_codes=["7107"])
+        total1, items1 = await get_cached_preview(fake_conn, f, limit=5, ttl_seconds=300, max_entries=32)
+        total2, items2 = await get_cached_preview(fake_conn, f, limit=5, ttl_seconds=300, max_entries=32)
+        assert total1 == 100 and total2 == 100
+        assert len(items1) == 1 and len(items2) == 1
+        assert mock_count.await_count == 1
+        assert mock_prev.await_count == 1
+
+        invalidate_search_cache()
+        await get_cached_preview(fake_conn, f, limit=5, ttl_seconds=300, max_entries=32)
+        assert mock_count.await_count == 2
+        assert mock_prev.await_count == 2
+
+
+def test_geo_normalization_and_street_candidates():
+    """Verify CEP, UF, street number, and street candidate helpers."""
+    from brcompany_api.domains.geo.service import (
+        build_street_candidates,
+        clean_postal_code,
+        clean_state,
+        clean_street_number,
+    )
+
+    assert clean_postal_code("01310-100") == "01310100"
+    assert clean_postal_code("00000-000") is None
+    assert clean_postal_code("123") is None
+
+    assert clean_state(" sp ") == "SP"
+    assert clean_state("XX") is None
+
+    assert clean_street_number(" 1047 ") == "1047"
+    assert clean_street_number("S/N") is None
+    assert clean_street_number("***") is None
+
+    candidates = build_street_candidates("AVENIDA", "Paulista")
+    assert "avenida paulista" in candidates
+    assert "av paulista" in candidates
+    assert "paulista" in candidates
+
+
+@pytest.mark.asyncio
+async def test_search_map_endpoint_and_limit_validation(unit_client: AsyncClient):
+    """Verify /api/v1/search/map caps limit at 100 and returns georeferenced items."""
+    from brcompany_api.domains.search.schemas import (
+        GeoRadiusFilter,
+        MapCenterPoint,
+        MapCompanyItem,
+        SearchFilterRequest,
+    )
+    from brcompany_api.domains.search.service import is_location_only_search, is_unfiltered_search
+
+    geo_filter = SearchFilterRequest(
+        geo_radius=GeoRadiusFilter(latitude=-23.5614, longitude=-46.6559, radius_km=2.0)
+    )
+    assert is_unfiltered_search(geo_filter) is False
+    assert is_location_only_search(geo_filter) is False
+
+    res_over_limit = await unit_client.post(
+        "/api/v1/search/map?limit=101",
+        json={"states": ["SP"]},
+    )
+    assert res_over_limit.status_code == 422
+
+    sample_map_item = MapCompanyItem(
+        cnpj="00000000000191",
+        cnpj_base="00000000",
+        legal_name="EMPRESA MAPA LTDA",
+        state="SP",
+        municipality_name="SAO PAULO",
+        latitude=-23.5614,
+        longitude=-46.6559,
+        geo_precision="cep_centroid",
+    )
+    with patch(
+        "brcompany_api.domains.search.service.get_cached_map_preview",
+        new_callable=AsyncMock,
+        return_value=(
+            42,
+            [sample_map_item],
+            MapCenterPoint(latitude=-23.5614, longitude=-46.6559),
+        ),
+    ) as mock_map:
+        res = await unit_client.post(
+            "/api/v1/search/map",
+            json={
+                "states": ["SP"],
+                "geo_radius": {"latitude": -23.5614, "longitude": -46.6559, "radius_km": 2.0},
+            },
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["total_companies"] == 42
+        assert body["mapped_count"] == 1
+        assert body["limit"] == 100
+        assert body["center"]["latitude"] == pytest.approx(-23.5614)
+        assert body["items"][0]["geo_precision"] == "cep_centroid"
+        mock_map.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_establishment_geo_mei_masking():
+    """Verify MEI LGPD masking prevents returning exact_number coordinates from cache."""
+    from brcompany_api.domains.geo.service import resolve_establishment_geo
+
+    fake_conn = AsyncMock()
+    est = {
+        "cnpj": "12345678000199",
+        "state": "SP",
+        "postal_code": "01310100",
+        "number": "1000",
+        "municipality_name": "SAO PAULO",
+    }
+
+    with patch(
+        "brcompany_api.domains.geo.service._lookup_company_cache",
+        new_callable=AsyncMock,
+        return_value={
+            "12345678000199": {
+                "latitude": -23.5614,
+                "longitude": -46.6559,
+                "precision": "exact_number",
+                "source": "br_company.geo",
+            }
+        },
+    ), patch(
+        "brcompany_api.domains.geo.service._lookup_postcode_centroids_batch",
+        new_callable=AsyncMock,
+        return_value={("SP", "01310100"): (-23.5620, -46.6550)},
+    ), patch(
+        "brcompany_api.domains.geo.service._save_company_cache_entries",
+        new_callable=AsyncMock,
+    ):
+        masked = await resolve_establishment_geo(fake_conn, est, mask_exact=True)
+        assert masked is not None
+        assert masked["precision"] == "cep_centroid"
+
+        unmasked = await resolve_establishment_geo(fake_conn, est, mask_exact=False)
+        assert unmasked is not None
+        assert unmasked["precision"] == "exact_number"
+
+
+
