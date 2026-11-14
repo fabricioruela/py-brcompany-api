@@ -185,6 +185,21 @@ class MapClusterItem(BaseModel):
     neighborhood: Optional[str] = None
     municipality_name: Optional[str] = None
     state: Optional[str] = None
+    bounds: Optional[GeoBoundsFilter] = None
+
+
+class MapCoordinateGroup(BaseModel):
+    coord_key: str
+    latitude: float
+    longitude: float
+    count: int
+    geo_precision: str
+    geo_source: Optional[str] = None
+    municipality_name: Optional[str] = None
+    state: Optional[str] = None
+    postal_codes: List[str] = Field(default_factory=list)
+    sample_names: List[str] = Field(default_factory=list)
+    items: List[MapCompanyItem] = Field(default_factory=list)
 
 
 class MapCenterPoint(BaseModel):
@@ -199,8 +214,28 @@ class MapSearchResponse(BaseModel):
     offset: int = 0
     has_more: bool = False
     next_offset: Optional[int] = None
-    mode: Literal["pins", "clusters"] = "pins"
+    mode: Literal["pins", "clusters", "coordinate_pins"] = "pins"
     center: Optional[MapCenterPoint] = None
     items: List[MapCompanyItem] = Field(default_factory=list)
     clusters: List[MapClusterItem] = Field(default_factory=list)
+    coordinate_groups: List[MapCoordinateGroup] = Field(default_factory=list)
+    execution_time_ms: float
+
+
+class MapPointCompaniesRequest(BaseModel):
+    filters: SearchFilterRequest
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    postal_codes: List[str] = Field(default_factory=list)
+    q_point: Optional[str] = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
+
+
+class MapPointCompaniesResponse(BaseModel):
+    total_companies: int
+    page: int
+    page_size: int
+    has_more: bool
+    items: List[MapCompanyItem]
     execution_time_ms: float
