@@ -57,6 +57,18 @@ async def test_domains_cnaes(client: AsyncClient):
     assert "code" in data["items"][0]
     assert "description" in data["items"][0]
 
+    page2 = await client.get("/api/v1/domains/cnaes?limit=5&offset=5")
+    assert page2.status_code == 200
+    page2_data = page2.json()
+    assert page2_data["total"] == data["total"]
+    if len(data["items"]) >= 10 and page2_data["items"]:
+        assert page2_data["items"][0]["code"] == data["items"][5]["code"]
+
+    full_res = await client.get("/api/v1/domains/cnaes?limit=2000")
+    assert full_res.status_code == 200
+    full_data = full_res.json()
+    assert len(full_data["items"]) == min(full_data["total"], 2000)
+
 
 @pytest.mark.asyncio
 async def test_domains_municipalities(client: AsyncClient):

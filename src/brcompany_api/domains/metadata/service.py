@@ -9,25 +9,44 @@ from brcompany_api.utils.geo import BRAZIL_STATES as _BRAZIL_STATES_SET, normali
 
 
 async def get_cnaes(
-    conn: psycopg.AsyncConnection, q: Optional[str] = None, limit: int = 100
-) -> List[dict]:
-    """Retrieve CNAE economic activities, optionally filtering by description or code."""
-    if q:
+    conn: psycopg.AsyncConnection,
+    q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[List[dict], int]:
+    """Retrieve CNAE economic activities with pagination, optionally filtering by description or code."""
+    clean_q = q.strip() if q else ""
+    if clean_q:
+        count_query = """
+            SELECT COUNT(*) AS total
+            FROM cnae
+            WHERE code ILIKE %(search)s OR description ILIKE %(search)s;
+        """
         query = """
             SELECT code, description
             FROM cnae
             WHERE code ILIKE %(search)s OR description ILIKE %(search)s
             ORDER BY code ASC
-            LIMIT %(limit)s;
+            LIMIT %(limit)s OFFSET %(offset)s;
         """
-        params = {"search": f"%{q}%", "limit": limit}
+        count_params = {"search": f"%{clean_q}%"}
+        params = {"search": f"%{clean_q}%", "limit": limit, "offset": offset}
     else:
-        query = "SELECT code, description FROM cnae ORDER BY code ASC LIMIT %(limit)s;"
-        params = {"limit": limit}
+        count_query = "SELECT COUNT(*) AS total FROM cnae;"
+        query = (
+            "SELECT code, description FROM cnae "
+            "ORDER BY code ASC LIMIT %(limit)s OFFSET %(offset)s;"
+        )
+        count_params = {}
+        params = {"limit": limit, "offset": offset}
 
     async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(count_query, count_params)
+        count_row = await cur.fetchone()
+        total = int(count_row["total"]) if count_row else 0
         await cur.execute(query, params)
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+        return rows, total
 
 
 async def get_municipalities(

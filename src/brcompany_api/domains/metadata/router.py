@@ -50,11 +50,12 @@ async def list_locations_cascade(
 async def list_cnaes(
     conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
     q: Annotated[Optional[str], Query(description="Search term in code or description")] = None,
-    limit: Annotated[int, Query(ge=1, le=500, description="Max items to return")] = 100,
+    limit: Annotated[int, Query(ge=1, le=2000, description="Max items to return")] = 100,
+    offset: Annotated[int, Query(ge=0, description="Pagination offset")] = 0,
 ):
-    rows = await service.get_cnaes(conn, q=q, limit=limit)
+    rows, total = await service.get_cnaes(conn, q=q, limit=limit, offset=offset)
     return DomainListResponse(
-        total=len(rows),
+        total=total,
         items=[DomainItem.model_validate(r) for r in rows],
     )
 
