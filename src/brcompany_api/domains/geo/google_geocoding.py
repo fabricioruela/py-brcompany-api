@@ -184,8 +184,8 @@ async def _fetch_establishments_for_geocoding(
                 e.postal_code,
                 e.state,
                 m.description AS municipality_name
-            FROM establishments e
-            LEFT JOIN municipalities m ON m.code = e.municipality_code
+            FROM establishment e
+            LEFT JOIN municipality m ON m.code = e.municipality_code
             WHERE e.cnpj = ANY(%(cnpjs)s);
             """,
             {"cnpjs": list(cnpjs)},
@@ -349,14 +349,14 @@ async def admin_geocode_companies(
         outcomes = await asyncio.gather(*[_run_single(client, c) for c in unique_cnpjs])
 
     final_results: List[Dict[str, Any]] = []
-    any_persisted = False
 
     for cnpj, est, query_info, result in outcomes:
         if result["status"] == "updated" and est is not None and query_info is not None:
             try:
                 await persist_google_geocode_result(conn, est, query_info, result)
-                any_persisted = True
+                await conn.commit()
             except Exception as exc:
+                await geo_service._safe_rollback(conn)
                 result = {
                     "cnpj": cnpj,
                     "status": "error",
@@ -364,8 +364,5 @@ async def admin_geocode_companies(
                     "message": f"Falha ao persistir na base geo: {exc}",
                 }
         final_results.append(result)
-
-    if any_persisted:
-        await conn.commit()
 
     return final_results
