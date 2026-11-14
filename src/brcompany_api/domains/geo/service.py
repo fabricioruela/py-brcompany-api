@@ -793,6 +793,262 @@ async def resolve_centroids_for_groups(
     return cep_centroids, city_centroids
 
 
+async def lookup_cep_prefix_bounds(
+    conn: psycopg.AsyncConnection,
+    prefix_items: Sequence[Tuple[str, str]],
+) -> Dict[Tuple[str, str], Dict[str, float]]:
+    """Aggregate min/max/avg coordinates from geo_postcode_cache for each (UF, CEP prefix)."""
+    unique_items = sorted(
+        {
+            (uf, prefix)
+            for uf, prefix in prefix_items
+            if uf in BRAZIL_STATES and prefix and prefix.isdigit() and 1 <= len(prefix) <= 8
+        }
+    )
+    if not unique_items:
+        return {}
+
+    regions = [item[0] for item in unique_items]
+    prefixes = [item[1] for item in unique_items]
+    starts = [item[1].ljust(8, "0") for item in unique_items]
+    ends = [item[1].ljust(8, "9") for item in unique_items]
+
+    result: Dict[Tuple[str, str], Dict[str, float]] = {}
+    try:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT
+                    p.region,
+                    p.prefix,
+                    MIN(c.latitude) AS min_lat,
+                    MAX(c.latitude) AS max_lat,
+                    MIN(c.longitude) AS min_lon,
+                    MAX(c.longitude) AS max_lon,
+                    AVG(c.latitude) AS avg_lat,
+                    AVG(c.longitude) AS avg_lon
+                FROM unnest(%(regions)s::text[], %(prefixes)s::text[], %(starts)s::text[], %(ends)s::text[]) AS p(region, prefix, p_start, p_end)
+                JOIN app_saas.geo_postcode_cache c
+                  ON c.region = p.region
+                 AND c.postcode_digits >= p.p_start
+                 AND c.postcode_digits <= p.p_end
+                GROUP BY p.region, p.prefix;
+                """,
+                {
+                    "regions": regions,
+                    "prefixes": prefixes,
+                    "starts": starts,
+                    "ends": ends,
+                },
+            )
+            for r in await cur.fetchall():
+                if r.get("avg_lat") is None or r.get("avg_lon") is None:
+                    continue
+                result[(r["region"], r["prefix"])] = {
+                    "min_lat": float(r["min_lat"]),
+                    "max_lat": float(r["max_lat"]),
+                    "min_lon": float(r["min_lon"]),
+                    "max_lon": float(r["max_lon"]),
+                    "avg_lat": float(r["avg_lat"]),
+                    "avg_lon": float(r["avg_lon"]),
+                }
+    except Exception as exc:
+        logger.debug("geo_postcode_cache prefix bounds lookup skipped: %s", exc)
+        await _safe_rollback(conn)
+    return result
+
+
+async def _resolve_uncached_geo_entries(
+    conn: psycopg.AsyncConnection,
+    unmasked_entries: Sequence[dict],
+    masked_entries: Sequence[dict],
+    *,
+    key_field: str = "cnpj",
+    mask_mei_exact: bool = True,
+) -> Tuple[Dict[str, dict], List[Tuple[str, float, float, str, Optional[str], str]]]:
+    """Resolve coordinates via 5-tier geo lookup for uncached establishments or address groups."""
+    resolved: Dict[str, dict] = {}
+    to_cache: List[Tuple[str, float, float, str, Optional[str], str]] = []
+    still_missing: List[dict] = list(masked_entries)
+
+    if unmasked_entries:
+        google_source_id = await get_google_source_id(conn, create_if_missing=False)
+
+        # 1. Batch exact_number by (UF, CEP, number)
+        cep_num_triples: List[Tuple[str, str, str]] = []
+        for est in unmasked_entries:
+            uf = clean_state(est.get("state"))
+            cep = clean_postal_code(est.get("postal_code"))
+            num = clean_street_number(est.get("number"))
+            if uf and cep and num:
+                cep_num_triples.append((uf, cep, num))
+        exact_cep_map = await _lookup_exact_number_by_cep_batch(conn, cep_num_triples, google_source_id)
+
+        after_exact_cep: List[dict] = []
+        for est in unmasked_entries:
+            entry_key = str(est.get(key_field) or "").strip()
+            uf = clean_state(est.get("state"))
+            cep = clean_postal_code(est.get("postal_code"))
+            num = clean_street_number(est.get("number"))
+            if uf and cep and num and (uf, cep, num) in exact_cep_map:
+                lat, lon, src = exact_cep_map[(uf, cep, num)]
+                resolved[entry_key] = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "precision": "exact_number",
+                    "source": src,
+                }
+                to_cache.append((entry_key, lat, lon, "exact_number", cep, src))
+            else:
+                after_exact_cep.append(est)
+
+        # 2. Batch exact_number by (UF, city, street, number)
+        street_num_queries: List[Tuple[str, str, List[str], str]] = []
+        for est in after_exact_cep:
+            uf = clean_state(est.get("state"))
+            city = (est.get("municipality_name") or "").strip()
+            num = clean_street_number(est.get("number"))
+            cands = build_street_candidates(est.get("street_type"), est.get("street"))
+            if uf and city and cands and num:
+                street_num_queries.append((uf, city, cands, num))
+        exact_street_map = await _lookup_exact_number_by_street_batch(conn, street_num_queries, google_source_id)
+
+        after_exact_street: List[dict] = []
+        for est in after_exact_cep:
+            entry_key = str(est.get(key_field) or "").strip()
+            uf = clean_state(est.get("state"))
+            cep = clean_postal_code(est.get("postal_code"))
+            city = (est.get("municipality_name") or "").strip()
+            num = clean_street_number(est.get("number"))
+            cands = build_street_candidates(est.get("street_type"), est.get("street"))
+            key = (uf, city, cands[0], num) if uf and city and cands and num else None
+            if key and key in exact_street_map:
+                lat, lon, src = exact_street_map[key]
+                resolved[entry_key] = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "precision": "exact_number",
+                    "source": src,
+                }
+                to_cache.append((entry_key, lat, lon, "exact_number", cep, src))
+            else:
+                after_exact_street.append(est)
+
+        # 3. Batch street-level by (UF, city, street)
+        street_queries: List[Tuple[str, str, List[str]]] = []
+        for est in after_exact_street:
+            uf = clean_state(est.get("state"))
+            city = (est.get("municipality_name") or "").strip()
+            cands = build_street_candidates(est.get("street_type"), est.get("street"))
+            if uf and city and cands:
+                street_queries.append((uf, city, cands))
+        street_map = await _lookup_street_centroids_batch(conn, street_queries, google_source_id)
+
+        for est in after_exact_street:
+            entry_key = str(est.get(key_field) or "").strip()
+            uf = clean_state(est.get("state"))
+            cep = clean_postal_code(est.get("postal_code"))
+            city = (est.get("municipality_name") or "").strip()
+            cands = build_street_candidates(est.get("street_type"), est.get("street"))
+            key = (uf, city, cands[0]) if uf and city and cands else None
+            if key and key in street_map:
+                lat, lon, src = street_map[key]
+                resolved[entry_key] = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "precision": "street",
+                    "source": src,
+                }
+                to_cache.append((entry_key, lat, lon, "street", cep, src))
+            else:
+                still_missing.append(est)
+
+    # 4. CEP centroid fallback (for remaining unmasked + LGPD-masked MEIs)
+    if still_missing:
+        cep_pairs: List[Tuple[str, str]] = []
+        for est in still_missing:
+            uf = clean_state(est.get("state"))
+            cep = clean_postal_code(est.get("postal_code"))
+            if uf and cep:
+                cep_pairs.append((uf, cep))
+
+        cep_centroids = await _lookup_postcode_centroids_batch(conn, cep_pairs)
+        after_cep: List[dict] = []
+
+        for est in still_missing:
+            entry_key = str(est.get(key_field) or "").strip()
+            uf = clean_state(est.get("state"))
+            cep = clean_postal_code(est.get("postal_code"))
+            is_masked = mask_mei_exact and bool(est.get("mei_optant"))
+            if uf and cep and (uf, cep) in cep_centroids:
+                lat, lon = cep_centroids[(uf, cep)]
+                resolved[entry_key] = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "precision": "cep_centroid",
+                    "source": DEFAULT_GEO_SOURCE,
+                }
+                if not is_masked:
+                    to_cache.append((entry_key, lat, lon, "cep_centroid", cep, DEFAULT_GEO_SOURCE))
+            else:
+                after_cep.append(est)
+
+        # 5. City centroid fallback
+        if after_cep:
+            city_pairs: List[Tuple[str, str]] = []
+            for est in after_cep:
+                uf = clean_state(est.get("state"))
+                city = (est.get("municipality_name") or "").strip()
+                if uf and city:
+                    city_pairs.append((uf, city))
+            city_centroids = await _lookup_city_centroids_batch(conn, city_pairs)
+
+            for est in after_cep:
+                entry_key = str(est.get(key_field) or "").strip()
+                uf = clean_state(est.get("state"))
+                city = (est.get("municipality_name") or "").strip()
+                cep = clean_postal_code(est.get("postal_code"))
+                is_masked = mask_mei_exact and bool(est.get("mei_optant"))
+                if uf and city and (uf, city) in city_centroids:
+                    lat, lon = city_centroids[(uf, city)]
+                    resolved[entry_key] = {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "precision": "city_centroid",
+                        "source": DEFAULT_GEO_SOURCE,
+                    }
+                    if not is_masked:
+                        to_cache.append((entry_key, lat, lon, "city_centroid", cep, DEFAULT_GEO_SOURCE))
+
+    return resolved, to_cache
+
+
+async def resolve_address_groups_geo_batch(
+    conn: psycopg.AsyncConnection,
+    address_groups: Sequence[dict],
+    *,
+    mask_mei_exact: bool = True,
+) -> Dict[str, dict]:
+    """Resolve coordinates for deduplicated address groups keyed by group_id."""
+    if not address_groups:
+        return {}
+    unmasked: List[dict] = []
+    masked: List[dict] = []
+    for grp in address_groups:
+        if mask_mei_exact and bool(grp.get("mei_optant")):
+            masked.append(grp)
+        else:
+            unmasked.append(grp)
+    resolved, _ = await _resolve_uncached_geo_entries(
+        conn,
+        unmasked,
+        masked,
+        key_field="group_id",
+        mask_mei_exact=mask_mei_exact,
+    )
+    return resolved
+
+
 async def resolve_establishments_geo_batch(
     conn: psycopg.AsyncConnection,
     establishments: Sequence[dict],
@@ -827,157 +1083,14 @@ async def resolve_establishments_geo_batch(
     if not unmasked_unresolved and not masked_unresolved:
         return resolved
 
-    to_cache: List[Tuple[str, float, float, str, Optional[str], str]] = []
-    still_missing: List[dict] = list(masked_unresolved)
-
-    if unmasked_unresolved:
-        google_source_id = await get_google_source_id(conn, create_if_missing=False)
-
-        # 1. Batch exact_number by (UF, CEP, number)
-        cep_num_triples: List[Tuple[str, str, str]] = []
-        for est in unmasked_unresolved:
-            uf = clean_state(est.get("state"))
-            cep = clean_postal_code(est.get("postal_code"))
-            num = clean_street_number(est.get("number"))
-            if uf and cep and num:
-                cep_num_triples.append((uf, cep, num))
-        exact_cep_map = await _lookup_exact_number_by_cep_batch(conn, cep_num_triples, google_source_id)
-
-        after_exact_cep: List[dict] = []
-        for est in unmasked_unresolved:
-            cnpj = str(est.get("cnpj") or "").strip()
-            uf = clean_state(est.get("state"))
-            cep = clean_postal_code(est.get("postal_code"))
-            num = clean_street_number(est.get("number"))
-            if uf and cep and num and (uf, cep, num) in exact_cep_map:
-                lat, lon, src = exact_cep_map[(uf, cep, num)]
-                resolved[cnpj] = {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "precision": "exact_number",
-                    "source": src,
-                }
-                to_cache.append((cnpj, lat, lon, "exact_number", cep, src))
-            else:
-                after_exact_cep.append(est)
-
-        # 2. Batch exact_number by (UF, city, street, number)
-        street_num_queries: List[Tuple[str, str, List[str], str]] = []
-        for est in after_exact_cep:
-            uf = clean_state(est.get("state"))
-            city = (est.get("municipality_name") or "").strip()
-            num = clean_street_number(est.get("number"))
-            cands = build_street_candidates(est.get("street_type"), est.get("street"))
-            if uf and city and cands and num:
-                street_num_queries.append((uf, city, cands, num))
-        exact_street_map = await _lookup_exact_number_by_street_batch(conn, street_num_queries, google_source_id)
-
-        after_exact_street: List[dict] = []
-        for est in after_exact_cep:
-            cnpj = str(est.get("cnpj") or "").strip()
-            uf = clean_state(est.get("state"))
-            cep = clean_postal_code(est.get("postal_code"))
-            city = (est.get("municipality_name") or "").strip()
-            num = clean_street_number(est.get("number"))
-            cands = build_street_candidates(est.get("street_type"), est.get("street"))
-            key = (uf, city, cands[0], num) if uf and city and cands and num else None
-            if key and key in exact_street_map:
-                lat, lon, src = exact_street_map[key]
-                resolved[cnpj] = {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "precision": "exact_number",
-                    "source": src,
-                }
-                to_cache.append((cnpj, lat, lon, "exact_number", cep, src))
-            else:
-                after_exact_street.append(est)
-
-        # 3. Batch street-level by (UF, city, street)
-        street_queries: List[Tuple[str, str, List[str]]] = []
-        for est in after_exact_street:
-            uf = clean_state(est.get("state"))
-            city = (est.get("municipality_name") or "").strip()
-            cands = build_street_candidates(est.get("street_type"), est.get("street"))
-            if uf and city and cands:
-                street_queries.append((uf, city, cands))
-        street_map = await _lookup_street_centroids_batch(conn, street_queries, google_source_id)
-
-        for est in after_exact_street:
-            cnpj = str(est.get("cnpj") or "").strip()
-            uf = clean_state(est.get("state"))
-            cep = clean_postal_code(est.get("postal_code"))
-            city = (est.get("municipality_name") or "").strip()
-            cands = build_street_candidates(est.get("street_type"), est.get("street"))
-            key = (uf, city, cands[0]) if uf and city and cands else None
-            if key and key in street_map:
-                lat, lon, src = street_map[key]
-                resolved[cnpj] = {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "precision": "street",
-                    "source": src,
-                }
-                to_cache.append((cnpj, lat, lon, "street", cep, src))
-            else:
-                still_missing.append(est)
-
-    # 4. CEP centroid fallback (for remaining unmasked + LGPD-masked MEIs)
-    if still_missing:
-        cep_pairs: List[Tuple[str, str]] = []
-        for est in still_missing:
-            uf = clean_state(est.get("state"))
-            cep = clean_postal_code(est.get("postal_code"))
-            if uf and cep:
-                cep_pairs.append((uf, cep))
-
-        cep_centroids = await _lookup_postcode_centroids_batch(conn, cep_pairs)
-        after_cep: List[dict] = []
-
-        for est in still_missing:
-            cnpj = str(est.get("cnpj") or "").strip()
-            uf = clean_state(est.get("state"))
-            cep = clean_postal_code(est.get("postal_code"))
-            is_masked = mask_mei_exact and bool(est.get("mei_optant"))
-            if uf and cep and (uf, cep) in cep_centroids:
-                lat, lon = cep_centroids[(uf, cep)]
-                resolved[cnpj] = {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "precision": "cep_centroid",
-                    "source": DEFAULT_GEO_SOURCE,
-                }
-                if not is_masked:
-                    to_cache.append((cnpj, lat, lon, "cep_centroid", cep, DEFAULT_GEO_SOURCE))
-            else:
-                after_cep.append(est)
-
-        # 5. City centroid fallback
-        if after_cep:
-            city_pairs: List[Tuple[str, str]] = []
-            for est in after_cep:
-                uf = clean_state(est.get("state"))
-                city = (est.get("municipality_name") or "").strip()
-                if uf and city:
-                    city_pairs.append((uf, city))
-            city_centroids = await _lookup_city_centroids_batch(conn, city_pairs)
-
-            for est in after_cep:
-                cnpj = str(est.get("cnpj") or "").strip()
-                uf = clean_state(est.get("state"))
-                city = (est.get("municipality_name") or "").strip()
-                cep = clean_postal_code(est.get("postal_code"))
-                is_masked = mask_mei_exact and bool(est.get("mei_optant"))
-                if uf and city and (uf, city) in city_centroids:
-                    lat, lon = city_centroids[(uf, city)]
-                    resolved[cnpj] = {
-                        "latitude": lat,
-                        "longitude": lon,
-                        "precision": "city_centroid",
-                        "source": DEFAULT_GEO_SOURCE,
-                    }
-                    if not is_masked:
-                        to_cache.append((cnpj, lat, lon, "city_centroid", cep, DEFAULT_GEO_SOURCE))
+    newly_resolved, to_cache = await _resolve_uncached_geo_entries(
+        conn,
+        unmasked_unresolved,
+        masked_unresolved,
+        key_field="cnpj",
+        mask_mei_exact=mask_mei_exact,
+    )
+    resolved.update(newly_resolved)
 
     if to_cache:
         await _save_company_cache_entries(conn, to_cache)
@@ -1026,11 +1139,19 @@ async def resolve_spatial_filter_targets(
     *,
     geo_radius: Optional[Any] = None,
     geo_bounds: Optional[Any] = None,
-    max_ceps: int = 5000,
+    viewport_bounds: Optional[Any] = None,
+    max_ceps: int = 15000,
 ) -> dict:
     """Resolve a map circle or bounding box into indexed UF, municipality_code, and CEP lists."""
-    if not geo_radius and not geo_bounds:
+    if not geo_radius and not geo_bounds and not viewport_bounds:
         return {"active": False}
+
+    def _normalize_box(box: Any) -> Tuple[float, float, float, float]:
+        b_min_lat = max(-90.0, min(float(box.south), float(box.north)))
+        b_max_lat = min(90.0, max(float(box.south), float(box.north)))
+        b_min_lon = max(-180.0, min(float(box.west), float(box.east)))
+        b_max_lon = min(180.0, max(float(box.west), float(box.east)))
+        return b_min_lat, b_max_lat, b_min_lon, b_max_lon
 
     if geo_radius is not None:
         lat = float(geo_radius.latitude)
@@ -1042,14 +1163,33 @@ async def resolve_spatial_filter_targets(
         min_lon, max_lon = max(-180.0, lon - lon_deg), min(180.0, lon + lon_deg)
         center_lat, center_lon = lat, lon
         radius_m = radius_km * 1000.0
+        if geo_bounds is not None:
+            gb_min_lat, gb_max_lat, gb_min_lon, gb_max_lon = _normalize_box(geo_bounds)
+            min_lat = max(min_lat, gb_min_lat)
+            max_lat = min(max_lat, gb_max_lat)
+            min_lon = max(min_lon, gb_min_lon)
+            max_lon = min(max_lon, gb_max_lon)
+        if viewport_bounds is not None:
+            vp_min_lat, vp_max_lat, vp_min_lon, vp_max_lon = _normalize_box(viewport_bounds)
+            min_lat = max(min_lat, vp_min_lat)
+            max_lat = min(max_lat, vp_max_lat)
+            min_lon = max(min_lon, vp_min_lon)
+            max_lon = min(max_lon, vp_max_lon)
     else:
-        min_lat = max(-90.0, min(float(geo_bounds.south), float(geo_bounds.north)))
-        max_lat = min(90.0, max(float(geo_bounds.south), float(geo_bounds.north)))
-        min_lon = max(-180.0, min(float(geo_bounds.west), float(geo_bounds.east)))
-        max_lon = min(180.0, max(float(geo_bounds.west), float(geo_bounds.east)))
+        active_box = geo_bounds or viewport_bounds
+        min_lat, max_lat, min_lon, max_lon = _normalize_box(active_box)
+        if geo_bounds is not None and viewport_bounds is not None:
+            vp_min_lat, vp_max_lat, vp_min_lon, vp_max_lon = _normalize_box(viewport_bounds)
+            min_lat = max(min_lat, vp_min_lat)
+            max_lat = min(max_lat, vp_max_lat)
+            min_lon = max(min_lon, vp_min_lon)
+            max_lon = min(max_lon, vp_max_lon)
         center_lat = (min_lat + max_lat) / 2.0
         center_lon = (min_lon + max_lon) / 2.0
         radius_m = None
+
+    if min_lat > max_lat or min_lon > max_lon:
+        return {"active": True, "empty": True}
 
     envelope_params = {
         "min_lon": min_lon,

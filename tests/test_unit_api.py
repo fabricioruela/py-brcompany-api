@@ -948,6 +948,175 @@ async def test_admin_geocode_companies_commits_and_isolates_persistence_errors()
     fake_conn.rollback.assert_awaited_once()
 
 
+def test_zoom_cluster_granularity_and_wide_viewport_detection():
+    """Verify progressive CEP prefix lengths across zoom levels and wide viewport threshold."""
+    from brcompany_api.domains.search.schemas import GeoBoundsFilter
+    from brcompany_api.domains.search.service import _cep_prefix_len_for_zoom, _is_wide_viewport
+
+    assert _cep_prefix_len_for_zoom(None, 50000) == 4
+    assert _cep_prefix_len_for_zoom(None, 10000) == 5
+    assert _cep_prefix_len_for_zoom(7, 50000) == 3
+    assert _cep_prefix_len_for_zoom(10, 50000) == 4
+    assert _cep_prefix_len_for_zoom(13, 50000) == 5
+    assert _cep_prefix_len_for_zoom(15, 50000) == 6
+    assert _cep_prefix_len_for_zoom(16, 50000) == 8
+
+    wide = GeoBoundsFilter(north=-23.2, south=-23.9, east=-46.2, west=-46.9)
+    narrow = GeoBoundsFilter(north=-23.56, south=-23.57, east=-46.65, west=-46.66)
+    assert _is_wide_viewport(10, narrow) is True
+    assert _is_wide_viewport(14, wide) is True
+    assert _is_wide_viewport(14, narrow) is False
+
+
+@pytest.mark.asyncio
+async def test_search_map_coordinate_pins_and_point_companies(unit_client: AsyncClient):
+    """Verify /search/map supports zoom/viewport coordinate_pins and /search/map/point-companies paginates."""
+    from brcompany_api.domains.search.schemas import (
+        GeoBoundsFilter,
+        MapCenterPoint,
+        MapCompanyItem,
+        MapCoordinateGroup,
+    )
+
+    sample_item = MapCompanyItem(
+        cnpj="00000000000191",
+        cnpj_base="00000000",
+        legal_name="COWORKING PAULISTA LTDA",
+        state="SP",
+        municipality_name="SAO PAULO",
+        latitude=-23.56141,
+        longitude=-46.65589,
+        geo_precision="exact_number",
+    )
+    sample_group = MapCoordinateGroup(
+        coord_key="-23.561410,-46.655890",
+        latitude=-23.56141,
+        longitude=-46.65589,
+        count=3420,
+        geo_precision="exact_number",
+        municipality_name="SAO PAULO",
+        state="SP",
+        postal_codes=["01310100"],
+        sample_names=["COWORKING PAULISTA LTDA"],
+        items=[],
+    )
+
+    with patch(
+        "brcompany_api.domains.search.service.get_cached_map_preview",
+        new_callable=AsyncMock,
+        return_value=(
+            3420,
+            "coordinate_pins",
+            [],
+            [],
+            [sample_group],
+            False,
+            None,
+            MapCenterPoint(latitude=-23.56141, longitude=-46.65589),
+        ),
+    ) as mock_map:
+        res = await unit_client.post(
+            "/api/v1/search/map?zoom=18&viewport_north=-23.55&viewport_south=-23.57&viewport_east=-46.64&viewport_west=-46.66",
+            json={"states": ["SP"], "municipality_codes": ["7107"]},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["mode"] == "coordinate_pins"
+        assert body["mapped_count"] == 3420
+        assert len(body["coordinate_groups"]) == 1
+        assert body["coordinate_groups"][0]["count"] == 3420
+        assert mock_map.call_args.kwargs["zoom"] == 18
+        assert isinstance(mock_map.call_args.kwargs["viewport_bounds"], GeoBoundsFilter)
+
+    with patch(
+        "brcompany_api.domains.search.service.search_map_point_companies",
+        new_callable=AsyncMock,
+        return_value=(120, [sample_item]),
+    ) as mock_point:
+        res_pt = await unit_client.post(
+            "/api/v1/search/map/point-companies",
+            json={
+                "filters": {"states": ["SP"], "municipality_codes": ["7107"]},
+                "latitude": -23.56141,
+                "longitude": -46.65589,
+                "postal_codes": ["01310100"],
+                "q_point": "PAULISTA",
+                "page": 1,
+                "page_size": 50,
+            },
+        )
+        assert res_pt.status_code == 200
+        pbody = res_pt.json()
+        assert pbody["total_companies"] == 120
+        assert pbody["has_more"] is True
+        assert pbody["items"][0]["cnpj"] == "00000000000191"
+        mock_point.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_cached_map_preview_switches_to_coordinate_pins_at_high_zoom():
+    """Verify high zoom >= 17 switches dense viewports (>2000) to coordinate_pins instead of clusters."""
+    from brcompany_api.domains.search.schemas import (
+        GeoBoundsFilter,
+        MapCenterPoint,
+        MapCoordinateGroup,
+        SearchFilterRequest,
+    )
+    from brcompany_api.domains.search.service import get_cached_map_preview
+
+    fake_conn = AsyncMock()
+    filters = SearchFilterRequest(states=["SP"], municipality_codes=["7107"])
+    vp = GeoBoundsFilter(north=-23.560, south=-23.563, east=-46.654, west=-46.658)
+    group = MapCoordinateGroup(
+        coord_key="-23.561410,-46.655890",
+        latitude=-23.56141,
+        longitude=-46.65589,
+        count=4500,
+        geo_precision="exact_number",
+    )
+
+    with patch(
+        "brcompany_api.domains.geo.service.resolve_spatial_filter_targets",
+        new_callable=AsyncMock,
+        return_value={"active": True, "empty": False, "postal_codes": ["01310100"]},
+    ), patch(
+        "brcompany_api.domains.search.service.count_matching_companies",
+        new_callable=AsyncMock,
+        return_value=4500,
+    ), patch(
+        "brcompany_api.domains.search.service.search_map_coordinate_groups",
+        new_callable=AsyncMock,
+        return_value=([group], MapCenterPoint(latitude=-23.56141, longitude=-46.65589)),
+    ) as mock_coord:
+        res = await get_cached_map_preview(
+            fake_conn,
+            filters,
+            ttl_seconds=0,
+            zoom=17,
+            viewport_bounds=vp,
+        )
+        assert res[1] == "coordinate_pins"
+        assert len(res[4]) == 1
+        assert res[4][0].count == 4500
+        mock_coord.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_spatial_filter_targets_disjoint_viewport_returns_empty():
+    """Verify disjoint geo_bounds and viewport_bounds immediately short-circuit as empty."""
+    from brcompany_api.domains.geo.service import resolve_spatial_filter_targets
+    from brcompany_api.domains.search.schemas import GeoBoundsFilter
+
+    fake_conn = AsyncMock()
+    res = await resolve_spatial_filter_targets(
+        fake_conn,
+        geo_bounds=GeoBoundsFilter(north=-23.5, south=-23.6, east=-46.6, west=-46.7),
+        viewport_bounds=GeoBoundsFilter(north=-22.8, south=-22.9, east=-43.1, west=-43.2),
+    )
+    assert res == {"active": True, "empty": True}
+
+
+
 
 
 
