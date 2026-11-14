@@ -211,8 +211,12 @@ CREATE TABLE IF NOT EXISTS app_saas.company_geo_cache (
     longitude DOUBLE PRECISION NOT NULL,
     precision VARCHAR(32) NOT NULL CHECK (precision IN ('exact_number', 'street', 'cep_centroid', 'city_centroid')),
     postal_code VARCHAR(16),
+    source VARCHAR(64) NOT NULL DEFAULT 'br_company.geo',
     resolved_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+
+ALTER TABLE app_saas.company_geo_cache
+    ADD COLUMN IF NOT EXISTS source VARCHAR(64) NOT NULL DEFAULT 'br_company.geo';
 
 CREATE TABLE IF NOT EXISTS app_saas.geo_postcode_cache (
     region VARCHAR(10) NOT NULL,

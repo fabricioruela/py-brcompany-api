@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     app_search_cache_ttl_seconds: int = 300
     app_search_cache_max_entries: int = 128
 
+    # Google Geocoding API (server-side forced georeferencing)
+    app_google_geocoding_api_key: str = ""
+    app_google_geocoding_timeout_seconds: float = 10.0
+
     # Asaas Payment Gateway settings
     app_asaas_api_url: str = "https://sandbox.asaas.com/api/v3"
     app_asaas_api_key: str = ""

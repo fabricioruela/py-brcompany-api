@@ -140,6 +140,8 @@ class MaskedCompanyPreviewItem(BaseModel):
     email_masked: Optional[str] = None
     has_phone: bool = False
     has_email: bool = False
+    geo_precision: Optional[str] = None
+    geo_source: Optional[str] = None
 
     @computed_field
     @property

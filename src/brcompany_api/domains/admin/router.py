@@ -2,15 +2,18 @@
 
 from datetime import datetime
 import json
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 from uuid import UUID
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 
+from brcompany_api.config import Settings, get_settings
 from brcompany_api.db import get_db_conn
 from brcompany_api.domains.auth.dependencies import require_admin_user
+from brcompany_api.domains.geo.google_geocoding import admin_geocode_companies
+from brcompany_api.domains.search.service import invalidate_search_cache
 
 router = APIRouter(prefix="/admin", tags=["Platform Administration"])
 
@@ -157,3 +160,100 @@ async def list_opt_outs(
         )
         rows = await cur.fetchall()
         return [OptOutItem(**r) for r in rows]
+
+
+class AdminGeocodeRequest(BaseModel):
+    cnpjs: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Lista de CNPJs (14 dígitos) para atualização forçada via Google Geocoding API (máximo 50 por lote).",
+    )
+
+
+class AdminGeocodeCompanyResult(BaseModel):
+    cnpj: str
+    status: Literal[
+        "updated",
+        "skipped_low_precision",
+        "skipped_incomplete_address",
+        "not_found",
+        "error",
+    ]
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    precision: Optional[str] = None
+    source: Optional[str] = None
+    google_location_type: Optional[str] = None
+    formatted_address: Optional[str] = None
+    query_address: Optional[str] = None
+    message: Optional[str] = None
+
+
+class AdminBatchGeocodeResponse(BaseModel):
+    requested: int
+    updated: int
+    skipped_low_precision: int
+    skipped_incomplete_address: int
+    not_found: int
+    errors: int
+    results: List[AdminGeocodeCompanyResult]
+
+
+@router.post(
+    "/geo/geocode-companies",
+    response_model=AdminBatchGeocodeResponse,
+    summary="Force Georeferencing via Google Geocoding API (Admin Only)",
+    description=(
+        "Consulta a Google Geocoding API usando logradouro, número, município e UF "
+        "para até 50 CNPJs e atualiza geo.addresses + app_saas.company_geo_cache."
+    ),
+)
+async def force_geocode_companies(
+    body: AdminGeocodeRequest,
+    _admin: Annotated[dict, Depends(require_admin_user)],
+    conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
+    settings: Annotated[Settings, Depends(get_settings)],
+):
+    api_key = (settings.app_google_geocoding_api_key or "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APP_GOOGLE_GEOCODING_API_KEY não configurada no servidor.",
+        )
+
+    cleaned_cnpjs = []
+    seen = set()
+    for raw in body.cnpjs:
+        digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+        if len(digits) == 14 and digits not in seen:
+            seen.add(digits)
+            cleaned_cnpjs.append(digits)
+
+    if not cleaned_cnpjs:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Informe ao menos um CNPJ válido de 14 dígitos.",
+        )
+
+    raw_results = await admin_geocode_companies(
+        conn,
+        cleaned_cnpjs,
+        api_key=api_key,
+        timeout_seconds=settings.app_google_geocoding_timeout_seconds,
+    )
+    results = [AdminGeocodeCompanyResult(**item) for item in raw_results]
+
+    updated_count = sum(1 for r in results if r.status == "updated")
+    if updated_count > 0:
+        invalidate_search_cache()
+
+    return AdminBatchGeocodeResponse(
+        requested=len(cleaned_cnpjs),
+        updated=updated_count,
+        skipped_low_precision=sum(1 for r in results if r.status == "skipped_low_precision"),
+        skipped_incomplete_address=sum(1 for r in results if r.status == "skipped_incomplete_address"),
+        not_found=sum(1 for r in results if r.status == "not_found"),
+        errors=sum(1 for r in results if r.status == "error"),
+        results=results,
+    )
