@@ -2,7 +2,7 @@
 
 from datetime import date
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from brcompany_api.domains.company.schemas import COMPANY_SIZE_LABELS, IDENTIFIER_TYPE_LABELS
@@ -160,6 +160,9 @@ class MaskedCompanyPreviewItem(BaseModel):
 class SearchPreviewResponse(BaseModel):
     total_companies: int
     preview_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 0
     items: List[MaskedCompanyPreviewItem]
     execution_time_ms: float
 
@@ -168,6 +171,18 @@ class MapCompanyItem(MaskedCompanyPreviewItem):
     latitude: float
     longitude: float
     geo_precision: str
+
+
+class MapClusterItem(BaseModel):
+    cluster_key: str
+    label: str
+    latitude: float
+    longitude: float
+    count: int
+    postal_code_prefix: Optional[str] = None
+    neighborhood: Optional[str] = None
+    municipality_name: Optional[str] = None
+    state: Optional[str] = None
 
 
 class MapCenterPoint(BaseModel):
@@ -179,6 +194,11 @@ class MapSearchResponse(BaseModel):
     total_companies: int
     mapped_count: int
     limit: int
+    offset: int = 0
+    has_more: bool = False
+    next_offset: Optional[int] = None
+    mode: Literal["pins", "clusters"] = "pins"
     center: Optional[MapCenterPoint] = None
-    items: List[MapCompanyItem]
+    items: List[MapCompanyItem] = Field(default_factory=list)
+    clusters: List[MapClusterItem] = Field(default_factory=list)
     execution_time_ms: float

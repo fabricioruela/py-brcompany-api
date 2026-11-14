@@ -404,6 +404,17 @@ async def resolve_establishment_geo(
     return None
 
 
+async def resolve_centroids_for_groups(
+    conn: psycopg.AsyncConnection,
+    cep_pairs: Sequence[Tuple[str, str]],
+    city_pairs: Sequence[Tuple[str, str]],
+) -> Tuple[Dict[Tuple[str, str], Tuple[float, float]], Dict[Tuple[str, str], Tuple[float, float]]]:
+    """Resolve CEP centroids and fallback city centroids for aggregated map clusters."""
+    cep_centroids = await _lookup_postcode_centroids_batch(conn, cep_pairs)
+    city_centroids = await _lookup_city_centroids_batch(conn, city_pairs)
+    return cep_centroids, city_centroids
+
+
 async def resolve_establishments_geo_batch(
     conn: psycopg.AsyncConnection,
     establishments: Sequence[dict],
@@ -533,7 +544,7 @@ async def resolve_spatial_filter_targets(
     *,
     geo_radius: Optional[Any] = None,
     geo_bounds: Optional[Any] = None,
-    max_ceps: int = 600,
+    max_ceps: int = 5000,
 ) -> dict:
     """Resolve a map circle or bounding box into indexed UF, municipality_code, and CEP lists."""
     if not geo_radius and not geo_bounds:
@@ -620,7 +631,7 @@ async def resolve_spatial_filter_targets(
                           AND geom IS NOT NULL
                           AND postcode_digits IS NOT NULL
                           AND geom && ST_MakeEnvelope(%(min_lon)s, %(min_lat)s, %(max_lon)s, %(max_lat)s, 4326)
-                        LIMIT 25000
+                        LIMIT 100000
                     ) sub
                     WHERE ST_DWithin(
                         geom::geography,
@@ -652,7 +663,7 @@ async def resolve_spatial_filter_targets(
                           AND geom IS NOT NULL
                           AND postcode_digits IS NOT NULL
                           AND geom && ST_MakeEnvelope(%(min_lon)s, %(min_lat)s, %(max_lon)s, %(max_lat)s, 4326)
-                        LIMIT 25000
+                        LIMIT 100000
                     ) sub
                     GROUP BY postcode_digits
                     ORDER BY dist_deg ASC
