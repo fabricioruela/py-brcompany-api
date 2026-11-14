@@ -414,11 +414,52 @@ def test_geo_normalization_and_street_candidates():
 
 
 @pytest.mark.asyncio
+async def test_search_required_location_and_paginated_preview(unit_client: AsyncClient):
+    """Verify /search/* requires UF + municipality and /search/preview supports uncapped pagination."""
+    from brcompany_api.domains.search.schemas import MaskedCompanyPreviewItem
+
+    # Missing municipality_codes or states must be rejected with 422
+    res_no_loc = await unit_client.post("/api/v1/search/preview", json={"states": ["SP"]})
+    assert res_no_loc.status_code == 422
+
+    res_no_state = await unit_client.post("/api/v1/search/count", json={"municipality_codes": ["7107"]})
+    assert res_no_state.status_code == 422
+
+    sample_items = [
+        MaskedCompanyPreviewItem(
+            cnpj=f"00000000000{i:03d}",
+            cnpj_base="00000000",
+            legal_name=f"EMPRESA {i} LTDA",
+        )
+        for i in range(1, 11)
+    ]
+    with patch(
+        "brcompany_api.domains.search.service.get_cached_preview",
+        new_callable=AsyncMock,
+        return_value=(125, sample_items),
+    ) as mock_prev:
+        res = await unit_client.post(
+            "/api/v1/search/preview?page=2&page_size=50",
+            json={"states": ["SP"], "municipality_codes": ["7107"]},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["total_companies"] == 125
+        assert body["preview_count"] == 10
+        assert body["page"] == 2
+        assert body["page_size"] == 50
+        assert body["total_pages"] == 3
+        assert len(body["items"]) == 10
+        mock_prev.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_search_map_endpoint_and_limit_validation(unit_client: AsyncClient):
-    """Verify /api/v1/search/map caps limit at 100 and returns georeferenced items."""
+    """Verify /api/v1/search/map requires UF+municipality, supports batches up to 2000, and returns pins or clusters."""
     from brcompany_api.domains.search.schemas import (
         GeoRadiusFilter,
         MapCenterPoint,
+        MapClusterItem,
         MapCompanyItem,
         SearchFilterRequest,
     )
@@ -430,9 +471,17 @@ async def test_search_map_endpoint_and_limit_validation(unit_client: AsyncClient
     assert is_unfiltered_search(geo_filter) is False
     assert is_location_only_search(geo_filter) is False
 
-    res_over_limit = await unit_client.post(
-        "/api/v1/search/map?limit=101",
+    # Missing municipality_codes must return 422
+    res_missing_mun = await unit_client.post(
+        "/api/v1/search/map?limit=500",
         json={"states": ["SP"]},
+    )
+    assert res_missing_mun.status_code == 422
+
+    # Batch size over 2000 rejected with 422
+    res_over_limit = await unit_client.post(
+        "/api/v1/search/map?limit=2001",
+        json={"states": ["SP"], "municipality_codes": ["7107"]},
     )
     assert res_over_limit.status_code == 422
 
@@ -450,26 +499,70 @@ async def test_search_map_endpoint_and_limit_validation(unit_client: AsyncClient
         "brcompany_api.domains.search.service.get_cached_map_preview",
         new_callable=AsyncMock,
         return_value=(
-            42,
+            420,
+            "pins",
             [sample_map_item],
+            [],
+            True,
+            200,
             MapCenterPoint(latitude=-23.5614, longitude=-46.6559),
         ),
     ) as mock_map:
         res = await unit_client.post(
-            "/api/v1/search/map",
+            "/api/v1/search/map?limit=200&offset=0",
             json={
                 "states": ["SP"],
+                "municipality_codes": ["7107"],
                 "geo_radius": {"latitude": -23.5614, "longitude": -46.6559, "radius_km": 2.0},
             },
         )
         assert res.status_code == 200
         body = res.json()
-        assert body["total_companies"] == 42
+        assert body["total_companies"] == 420
         assert body["mapped_count"] == 1
-        assert body["limit"] == 100
+        assert body["limit"] == 200
+        assert body["offset"] == 0
+        assert body["has_more"] is True
+        assert body["next_offset"] == 200
+        assert body["mode"] == "pins"
         assert body["center"]["latitude"] == pytest.approx(-23.5614)
         assert body["items"][0]["geo_precision"] == "cep_centroid"
         mock_map.assert_awaited_once()
+
+    sample_cluster = MapClusterItem(
+        cluster_key="SP:01310:-23.5614:-46.6559",
+        label="BELA VISTA • CEP 01310*",
+        latitude=-23.5614,
+        longitude=-46.6559,
+        count=12500,
+        postal_code_prefix="01310",
+        neighborhood="BELA VISTA",
+        municipality_name="SAO PAULO",
+        state="SP",
+    )
+    with patch(
+        "brcompany_api.domains.search.service.get_cached_map_preview",
+        new_callable=AsyncMock,
+        return_value=(
+            12500,
+            "clusters",
+            [],
+            [sample_cluster],
+            False,
+            None,
+            MapCenterPoint(latitude=-23.5614, longitude=-46.6559),
+        ),
+    ):
+        res_clusters = await unit_client.post(
+            "/api/v1/search/map",
+            json={"states": ["SP"], "municipality_codes": ["7107"]},
+        )
+        assert res_clusters.status_code == 200
+        cbody = res_clusters.json()
+        assert cbody["mode"] == "clusters"
+        assert cbody["mapped_count"] == 12500
+        assert len(cbody["clusters"]) == 1
+        assert cbody["clusters"][0]["count"] == 12500
 
 
 @pytest.mark.asyncio

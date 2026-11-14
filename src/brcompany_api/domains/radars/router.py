@@ -12,7 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from brcompany_api.db import get_db_conn
 from brcompany_api.domains.auth.dependencies import get_current_user
 from brcompany_api.domains.search.schemas import SearchFilterRequest
-from brcompany_api.domains.search.service import count_matching_companies
+from brcompany_api.domains.search.service import (
+    count_matching_companies,
+    validate_required_location_filters,
+)
 
 router = APIRouter(prefix="/radars", tags=["Saved Niche Radars (Smart Alerts)"])
 
@@ -97,6 +100,7 @@ async def create_radar(
     current_user: Annotated[dict, Depends(get_current_user)],
     conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
 ):
+    validate_required_location_filters(body.filters)
     if not current_user.get("has_active_subscription") and current_user.get("role") != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

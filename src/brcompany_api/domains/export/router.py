@@ -9,6 +9,7 @@ from fastapi.responses import Response
 from brcompany_api.db import get_db_conn
 from brcompany_api.domains.auth.dependencies import get_current_user
 from brcompany_api.domains.export import service
+from brcompany_api.domains.search.service import validate_required_location_filters
 from brcompany_api.domains.export.schemas import (
     ExportCalculateRequest,
     ExportCalculateResponse,
@@ -30,6 +31,7 @@ async def export_calculate(
     current_user: Annotated[dict, Depends(get_current_user)],
     conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
 ):
+    validate_required_location_filters(body.filters)
     return await service.calculate_export_cost(conn, user_id=current_user["id"], req=body)
 
 
@@ -42,6 +44,7 @@ async def export_download(
     current_user: Annotated[dict, Depends(get_current_user)],
     conn: Annotated[psycopg.AsyncConnection, Depends(get_db_conn)],
 ):
+    validate_required_location_filters(body.filters)
     list_id, _list_name, file_bytes = await service.execute_export_and_store_files(
         conn, user_id=current_user["id"], req=body
     )

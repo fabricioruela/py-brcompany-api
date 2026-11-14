@@ -4,23 +4,27 @@ from collections import OrderedDict
 import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from fastapi import HTTPException, status
 import psycopg
 from psycopg.rows import dict_row
 
 from brcompany_api.domains.geo import service as geo_service
 from brcompany_api.domains.search.schemas import (
     MapCenterPoint,
+    MapClusterItem,
     MapCompanyItem,
     MaskedCompanyPreviewItem,
     SearchFilterRequest,
 )
 from brcompany_api.utils.masking import mask_email, mask_phone, mask_street
 
+MAP_INDIVIDUAL_PIN_THRESHOLD = 5000
+
 _INDEX_POPULATED_TTL_SECONDS = 60.0
 _index_populated_cache: Optional[Tuple[bool, float]] = None
 _search_count_cache: "OrderedDict[Tuple[str, str], Tuple[int, float]]" = OrderedDict()
-_search_preview_cache: "OrderedDict[Tuple[str, str, int], Tuple[Tuple[int, List[MaskedCompanyPreviewItem]], float]]" = OrderedDict()
-_search_map_cache: "OrderedDict[Tuple[str, str, int], Tuple[Tuple[int, List[MapCompanyItem], Optional[MapCenterPoint]], float]]" = OrderedDict()
+_search_preview_cache: "OrderedDict[Tuple[str, str, int, int], Tuple[Tuple[int, List[MaskedCompanyPreviewItem]], float]]" = OrderedDict()
+_search_map_cache: "OrderedDict[Tuple[str, str, int, int], Tuple[Tuple[int, str, List[MapCompanyItem], List[MapClusterItem], bool, Optional[int], Optional[MapCenterPoint]], float]]" = OrderedDict()
 
 
 def invalidate_search_cache() -> None:
@@ -38,6 +42,15 @@ def _clean_states(filters: SearchFilterRequest) -> List[str]:
 
 def _clean_muns(filters: SearchFilterRequest) -> List[str]:
     return [m.strip()[:4] for m in filters.municipality_codes if m.strip()]
+
+
+def validate_required_location_filters(filters: SearchFilterRequest) -> None:
+    """Require at least one UF and one municipality code before querying."""
+    if not _clean_states(filters) or not _clean_muns(filters):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Estado (UF) e Município são obrigatórios para esta operação.",
+        )
 
 
 def _has_other_filters(filters: SearchFilterRequest) -> bool:
@@ -519,10 +532,11 @@ def _row_to_masked_preview_dict(r: dict) -> dict:
 async def preview_matching_companies(
     conn: psycopg.AsyncConnection,
     filters: SearchFilterRequest,
-    limit: int = 5,
+    limit: int = 50,
+    offset: int = 0,
     spatial_targets: Optional[dict] = None,
 ) -> List[MaskedCompanyPreviewItem]:
-    """Fetch top 5 matching companies with masked contact and street fields."""
+    """Fetch paginated matching companies with masked contact and street fields."""
     use_index = await is_search_index_populated(conn)
     source_table = "company_search_index" if use_index else FALLBACK_SOURCE_SQL
     where_sql, params = await resolve_effective_where_clause(
@@ -534,7 +548,8 @@ async def preview_matching_companies(
     )
     if where_sql == "FALSE":
         return []
-    params["limit"] = min(max(limit, 1), 5)
+    params["limit"] = min(max(limit, 1), 200)
+    params["offset"] = max(offset, 0)
 
     query = f"""
         SELECT
@@ -565,7 +580,7 @@ async def preview_matching_companies(
         FROM {source_table} csi
         WHERE {where_sql}
         ORDER BY csi.start_activity_date DESC NULLS LAST, csi.cnpj ASC
-        LIMIT %(limit)s;
+        LIMIT %(limit)s OFFSET %(offset)s;
     """
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(query, params)
@@ -577,11 +592,13 @@ async def preview_matching_companies(
 async def search_map_companies(
     conn: psycopg.AsyncConnection,
     filters: SearchFilterRequest,
-    limit: int = 100,
+    limit: int = 500,
+    offset: int = 0,
     spatial_targets: Optional[dict] = None,
-) -> Tuple[List[MapCompanyItem], Optional[MapCenterPoint]]:
-    """Fetch up to 100 matching companies with masked contacts and br_company.geo coordinates."""
-    safe_limit = min(max(limit, 1), 100)
+) -> Tuple[List[MapCompanyItem], int, Optional[MapCenterPoint]]:
+    """Fetch paginated matching companies with masked contacts and br_company.geo coordinates."""
+    safe_limit = min(max(limit, 1), 2000)
+    safe_offset = max(offset, 0)
     use_index = await is_search_index_populated(conn)
     source_table = "company_search_index" if use_index else FALLBACK_SOURCE_SQL
     where_sql, params = await resolve_effective_where_clause(
@@ -592,8 +609,9 @@ async def search_map_companies(
         spatial_targets=spatial_targets,
     )
     if where_sql == "FALSE":
-        return [], _compute_filter_center(filters, [])
+        return [], 0, _compute_filter_center(filters, [])
     params["limit"] = safe_limit
+    params["offset"] = safe_offset
 
     query = f"""
         SELECT
@@ -625,7 +643,7 @@ async def search_map_companies(
         FROM {source_table} csi
         WHERE {where_sql}
         ORDER BY csi.start_activity_date DESC NULLS LAST, csi.cnpj ASC
-        LIMIT %(limit)s;
+        LIMIT %(limit)s OFFSET %(offset)s;
     """
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(query, params)
@@ -649,7 +667,142 @@ async def search_map_companies(
         )
 
     center = _compute_filter_center(filters, items)
-    return items, center
+    return items, len(rows), center
+
+
+async def search_map_clusters(
+    conn: psycopg.AsyncConnection,
+    filters: SearchFilterRequest,
+    total_companies: int,
+    spatial_targets: Optional[dict] = None,
+) -> Tuple[List[MapClusterItem], Optional[MapCenterPoint]]:
+    """Aggregate massive result sets into server-side geographic clusters by CEP prefix."""
+    use_index = await is_search_index_populated(conn)
+    source_table = "company_search_index" if use_index else FALLBACK_SOURCE_SQL
+    where_sql, params = await resolve_effective_where_clause(
+        conn,
+        filters,
+        alias="csi",
+        use_index_table=use_index,
+        spatial_targets=spatial_targets,
+    )
+    if where_sql == "FALSE":
+        return [], _compute_filter_center(filters, [])
+
+    prefix_len = 4 if total_companies > 15000 else 5
+    params["prefix_len"] = prefix_len
+
+    query = f"""
+        SELECT
+            csi.state,
+            LEFT(
+                COALESCE(NULLIF(regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g'), ''), ''),
+                %(prefix_len)s
+            ) AS cep_prefix,
+            MIN(
+                CASE
+                    WHEN length(regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g')) = 8
+                         AND regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g') <> '00000000'
+                    THEN regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g')
+                    ELSE NULL
+                END
+            ) AS sample_cep,
+            MAX(csi.municipality_name) AS municipality_name,
+            MAX(NULLIF(TRIM(csi.neighborhood), '')) AS neighborhood,
+            COUNT(*)::int AS company_count
+        FROM {source_table} csi
+        WHERE {where_sql}
+        GROUP BY 1, 2
+        ORDER BY company_count DESC;
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(query, params)
+        rows = await cur.fetchall()
+
+    cep_pairs: List[Tuple[str, str]] = []
+    city_pairs: List[Tuple[str, str]] = []
+    for r in rows:
+        uf = geo_service.clean_state(r.get("state"))
+        sample_cep = geo_service.clean_postal_code(r.get("sample_cep"))
+        city = (r.get("municipality_name") or "").strip()
+        if uf and sample_cep:
+            cep_pairs.append((uf, sample_cep))
+        if uf and city:
+            city_pairs.append((uf, city))
+
+    cep_centroids, city_centroids = await geo_service.resolve_centroids_for_groups(
+        conn, cep_pairs, city_pairs
+    )
+
+    merged: Dict[Tuple[float, float], Dict[str, Any]] = {}
+    for r in rows:
+        uf = geo_service.clean_state(r.get("state"))
+        sample_cep = geo_service.clean_postal_code(r.get("sample_cep"))
+        city = (r.get("municipality_name") or "").strip()
+        coord = None
+        if uf and sample_cep and (uf, sample_cep) in cep_centroids:
+            coord = cep_centroids[(uf, sample_cep)]
+        elif uf and city and (uf, city) in city_centroids:
+            coord = city_centroids[(uf, city)]
+        if not coord:
+            continue
+
+        lat, lon = coord
+        coord_key = (round(lat, 5), round(lon, 5))
+        cnt = int(r.get("company_count") or 0)
+        if cnt <= 0:
+            continue
+        cep_prefix = (r.get("cep_prefix") or "").strip() or None
+        neighborhood = (r.get("neighborhood") or "").strip() or None
+        if coord_key in merged:
+            merged[coord_key]["count"] += cnt
+            if not merged[coord_key]["neighborhood"] and neighborhood:
+                merged[coord_key]["neighborhood"] = neighborhood
+        else:
+            label_parts = []
+            if neighborhood:
+                label_parts.append(neighborhood)
+            if cep_prefix:
+                label_parts.append(f"CEP {cep_prefix}*")
+            if not label_parts:
+                label_parts.append(city or uf or "Região")
+            merged[coord_key] = {
+                "cluster_key": f"{uf or 'BR'}:{cep_prefix or coord_key[0]}:{coord_key[1]}",
+                "label": " • ".join(label_parts),
+                "latitude": lat,
+                "longitude": lon,
+                "count": cnt,
+                "postal_code_prefix": cep_prefix,
+                "neighborhood": neighborhood,
+                "municipality_name": city or None,
+                "state": uf,
+            }
+
+    clusters = [
+        MapClusterItem(**entry)
+        for entry in sorted(merged.values(), key=lambda x: x["count"], reverse=True)
+    ]
+
+    if filters.geo_radius is not None:
+        center = MapCenterPoint(
+            latitude=filters.geo_radius.latitude,
+            longitude=filters.geo_radius.longitude,
+        )
+    elif filters.geo_bounds is not None:
+        center = MapCenterPoint(
+            latitude=(filters.geo_bounds.north + filters.geo_bounds.south) / 2.0,
+            longitude=(filters.geo_bounds.east + filters.geo_bounds.west) / 2.0,
+        )
+    elif clusters:
+        total_weight = sum(c.count for c in clusters) or 1
+        center = MapCenterPoint(
+            latitude=sum(c.latitude * c.count for c in clusters) / total_weight,
+            longitude=sum(c.longitude * c.count for c in clusters) / total_weight,
+        )
+    else:
+        center = None
+
+    return clusters, center
 
 
 def _compute_filter_center(
@@ -716,19 +869,29 @@ async def get_cached_count(
 async def get_cached_preview(
     conn: psycopg.AsyncConnection,
     filters: SearchFilterRequest,
-    limit: int = 5,
+    page: int = 1,
+    page_size: int = 50,
+    limit: Optional[int] = None,
     ttl_seconds: int = 300,
     max_entries: int = 128,
 ) -> Tuple[int, List[MaskedCompanyPreviewItem]]:
-    """Return total count and masked preview items using an ETL/opt-out-aware TTL cache."""
+    """Return total count and paginated masked preview items using an ETL/opt-out-aware TTL cache."""
+    safe_page = max(page, 1)
+    safe_size = min(max(limit if limit is not None else page_size, 1), 200)
+    offset = (safe_page - 1) * safe_size
+
     if ttl_seconds <= 0 or max_entries <= 0:
         total = await count_matching_companies(conn, filters)
-        items = await preview_matching_companies(conn, filters, limit=limit) if total > 0 else []
+        items = (
+            await preview_matching_companies(conn, filters, limit=safe_size, offset=offset)
+            if total > 0 and offset < total
+            else []
+        )
         return total, items
 
     epoch = await get_search_cache_epoch(conn)
     filter_key = _normalized_filter_key(filters)
-    preview_key = (epoch, filter_key, limit)
+    preview_key = (epoch, filter_key, safe_page, safe_size)
     cached = _cache_get(_search_preview_cache, preview_key, ttl_seconds)
     if cached is not None:
         return cached
@@ -736,7 +899,11 @@ async def get_cached_preview(
     total = await get_cached_count(
         conn, filters, ttl_seconds=ttl_seconds, max_entries=max_entries
     )
-    items = await preview_matching_companies(conn, filters, limit=limit) if total > 0 else []
+    items = (
+        await preview_matching_companies(conn, filters, limit=safe_size, offset=offset)
+        if total > 0 and offset < total
+        else []
+    )
     result = (total, items)
     _cache_set(_search_preview_cache, preview_key, result, max_entries)
     return result
@@ -745,14 +912,33 @@ async def get_cached_preview(
 async def get_cached_map_preview(
     conn: psycopg.AsyncConnection,
     filters: SearchFilterRequest,
-    limit: int = 100,
+    limit: int = 500,
+    offset: int = 0,
+    cluster_threshold: int = MAP_INDIVIDUAL_PIN_THRESHOLD,
     ttl_seconds: int = 300,
     max_entries: int = 128,
-) -> Tuple[int, List[MapCompanyItem], Optional[MapCenterPoint]]:
-    """Return total count and up to 100 georeferenced masked items using TTL cache."""
-    safe_limit = min(max(limit, 1), 100)
+) -> Tuple[
+    int,
+    str,
+    List[MapCompanyItem],
+    List[MapClusterItem],
+    bool,
+    Optional[int],
+    Optional[MapCenterPoint],
+]:
+    """Return total count and either progressive pins or server-side aggregated clusters."""
+    safe_limit = min(max(limit, 1), 2000)
+    safe_offset = max(offset, 0)
 
-    async def _execute_uncached() -> Tuple[int, List[MapCompanyItem], Optional[MapCenterPoint]]:
+    async def _execute_uncached() -> Tuple[
+        int,
+        str,
+        List[MapCompanyItem],
+        List[MapClusterItem],
+        bool,
+        Optional[int],
+        Optional[MapCenterPoint],
+    ]:
         spatial = None
         if filters.geo_radius is not None or filters.geo_bounds is not None:
             spatial = await geo_service.resolve_spatial_filter_targets(
@@ -761,21 +947,47 @@ async def get_cached_map_preview(
                 geo_bounds=filters.geo_bounds,
             )
             if spatial.get("empty"):
-                return 0, [], _compute_filter_center(filters, [])
+                return 0, "pins", [], [], False, None, _compute_filter_center(filters, [])
+
         total = await count_matching_companies(conn, filters, spatial_targets=spatial)
-        items, center = (
-            await search_map_companies(conn, filters, limit=safe_limit, spatial_targets=spatial)
-            if total > 0
-            else ([], _compute_filter_center(filters, []))
+        if total <= 0:
+            return 0, "pins", [], [], False, None, _compute_filter_center(filters, [])
+
+        if total > cluster_threshold:
+            clusters, center = await search_map_clusters(
+                conn,
+                filters,
+                total_companies=total,
+                spatial_targets=spatial,
+            )
+            cluster_total = sum(c.count for c in clusters)
+            return max(total, cluster_total), "clusters", [], clusters, False, None, center
+
+        items, raw_count, center = await search_map_companies(
+            conn,
+            filters,
+            limit=safe_limit,
+            offset=safe_offset,
+            spatial_targets=spatial,
         )
-        return max(total, len(items)), items, center
+        next_off = safe_offset + raw_count
+        has_more = raw_count >= safe_limit and next_off < total
+        return (
+            max(total, len(items)),
+            "pins",
+            items,
+            [],
+            has_more,
+            next_off if has_more else None,
+            center,
+        )
 
     if ttl_seconds <= 0 or max_entries <= 0:
         return await _execute_uncached()
 
     epoch = await get_search_cache_epoch(conn)
     filter_key = _normalized_filter_key(filters)
-    map_key = (epoch, filter_key, safe_limit)
+    map_key = (epoch, filter_key, safe_offset, safe_limit)
     cached = _cache_get(_search_map_cache, map_key, ttl_seconds)
     if cached is not None:
         return cached
