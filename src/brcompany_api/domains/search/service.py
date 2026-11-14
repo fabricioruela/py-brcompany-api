@@ -586,7 +586,19 @@ async def preview_matching_companies(
         await cur.execute(query, params)
         rows = await cur.fetchall()
 
-    return [MaskedCompanyPreviewItem(**_row_to_masked_preview_dict(r)) for r in rows]
+    cnpjs = [str(r["cnpj"]).strip() for r in rows if r.get("cnpj")]
+    cached_geo = await geo_service._lookup_company_cache(conn, cnpjs)
+
+    items: List[MaskedCompanyPreviewItem] = []
+    for r in rows:
+        item_dict = _row_to_masked_preview_dict(r)
+        g = cached_geo.get(str(r["cnpj"]).strip())
+        if g:
+            item_dict["geo_precision"] = g["precision"]
+            item_dict["geo_source"] = g.get("source")
+        items.append(MaskedCompanyPreviewItem(**item_dict))
+
+    return items
 
 
 async def search_map_companies(
@@ -663,6 +675,7 @@ async def search_map_companies(
                 latitude=coord["latitude"],
                 longitude=coord["longitude"],
                 geo_precision=coord["precision"],
+                geo_source=coord.get("source"),
             )
         )
 

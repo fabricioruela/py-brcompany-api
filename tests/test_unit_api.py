@@ -607,4 +607,234 @@ async def test_resolve_establishment_geo_mei_masking():
         assert unmasked["precision"] == "exact_number"
 
 
+def test_google_geocoding_query_and_precision_mapping():
+    """Verify address query composition (logradouro, número, município, UF) and location_type mapping."""
+    from brcompany_api.domains.geo.google_geocoding import (
+        build_full_street,
+        build_google_geocoding_query,
+        map_google_location_type,
+    )
+
+    assert build_full_street("AVENIDA", "Paulista") == "AVENIDA Paulista"
+    assert build_full_street("RUA", "Rua das Flores") == "Rua das Flores"
+
+    q1 = build_google_geocoding_query({
+        "street_type": "AVENIDA",
+        "street": "PAULISTA",
+        "number": "1000",
+        "municipality_name": "SAO PAULO",
+        "state": "sp",
+    })
+    assert q1 is not None
+    assert q1["query_address"] == "AVENIDA PAULISTA, 1000, SAO PAULO - SP, Brasil"
+    assert q1["components"] == "country:BR|administrative_area:SP"
+
+    q_sn = build_google_geocoding_query({
+        "street_type": "RUA",
+        "street": "DAS FLORES",
+        "number": "S/N",
+        "municipality_name": "BELO HORIZONTE",
+        "state": "MG",
+    })
+    assert q_sn is not None
+    assert q_sn["query_address"] == "RUA DAS FLORES, BELO HORIZONTE - MG, Brasil"
+
+    assert build_google_geocoding_query({"state": "SP", "municipality_name": "SAO PAULO"}) is None
+
+    assert map_google_location_type("ROOFTOP") == "exact_number"
+    assert map_google_location_type("RANGE_INTERPOLATED") == "exact_number"
+    assert map_google_location_type("GEOMETRIC_CENTER") == "street"
+    assert map_google_location_type("APPROXIMATE") is None
+
+
+@pytest.mark.asyncio
+async def test_geocode_address_google_responses():
+    """Verify Google Geocoding client handles ROOFTOP, APPROXIMATE skip, ZERO_RESULTS, and errors."""
+    from unittest.mock import MagicMock
+    from brcompany_api.domains.geo.google_geocoding import geocode_address_google
+
+    query_info = {
+        "uf": "SP",
+        "city": "SAO PAULO",
+        "full_street": "AVENIDA PAULISTA",
+        "number": "1000",
+        "query_address": "AVENIDA PAULISTA, 1000, SAO PAULO - SP, Brasil",
+        "components": "country:BR|administrative_area:SP",
+    }
+
+    def _mock_client(payload):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = payload
+        client = AsyncMock()
+        client.get.return_value = resp
+        return client
+
+    ok_res = await geocode_address_google(
+        _mock_client({
+            "status": "OK",
+            "results": [{
+                "formatted_address": "Av. Paulista, 1000 - Bela Vista, São Paulo - SP, Brasil",
+                "geometry": {"location": {"lat": -23.5649, "lng": -46.6519}, "location_type": "ROOFTOP"},
+            }],
+        }),
+        "fake-key",
+        query_info,
+    )
+    assert ok_res["status"] == "updated"
+    assert ok_res["precision"] == "exact_number"
+    assert ok_res["source"] == "google_geocoding"
+    assert ok_res["latitude"] == pytest.approx(-23.5649)
+
+    approx_res = await geocode_address_google(
+        _mock_client({
+            "status": "OK",
+            "results": [{
+                "formatted_address": "São Paulo - SP, Brasil",
+                "geometry": {"location": {"lat": -23.5505, "lng": -46.6333}, "location_type": "APPROXIMATE"},
+            }],
+        }),
+        "fake-key",
+        query_info,
+    )
+    assert approx_res["status"] == "skipped_low_precision"
+
+    zero_res = await geocode_address_google(
+        _mock_client({"status": "ZERO_RESULTS", "results": []}),
+        "fake-key",
+        query_info,
+    )
+    assert zero_res["status"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_admin_force_geocode_endpoint_auth_validation_and_execution(unit_client: AsyncClient):
+    """Verify /api/v1/admin/geo/geocode-companies enforces admin auth, batch cap, and invokes geocoder."""
+    from brcompany_api.config import Settings, get_settings
+    from brcompany_api.domains.auth.dependencies import require_admin_user
+
+    # 1. Unauthenticated must fail (401/403)
+    res_unauth = await unit_client.post(
+        "/api/v1/admin/geo/geocode-companies",
+        json={"cnpjs": ["00000000000191"]},
+    )
+    assert res_unauth.status_code in (401, 403)
+
+    # Override admin dependency for remaining assertions
+    app.dependency_overrides[require_admin_user] = lambda: {"id": "00000000-0000-0000-0000-000000000001", "role": "admin"}
+    try:
+        # 2. Missing API key returns 503
+        app.dependency_overrides[get_settings] = lambda: Settings(app_google_geocoding_api_key="")
+        res_no_key = await unit_client.post(
+            "/api/v1/admin/geo/geocode-companies",
+            json={"cnpjs": ["00000000000191"]},
+        )
+        assert res_no_key.status_code == 503
+
+        # 3. Over 50 CNPJs returns 422
+        app.dependency_overrides[get_settings] = lambda: Settings(app_google_geocoding_api_key="test-key")
+        res_over_50 = await unit_client.post(
+            "/api/v1/admin/geo/geocode-companies",
+            json={"cnpjs": [f"00000000000{i:03d}" for i in range(51)]},
+        )
+        assert res_over_50.status_code == 422
+
+        # 4. Valid admin request updates and invalidates cache
+        mocked_results = [
+            {
+                "cnpj": "00000000000191",
+                "status": "updated",
+                "latitude": -23.5649,
+                "longitude": -46.6519,
+                "precision": "exact_number",
+                "source": "google_geocoding",
+                "google_location_type": "ROOFTOP",
+                "formatted_address": "Av. Paulista, 1000",
+                "query_address": "AVENIDA PAULISTA, 1000, SAO PAULO - SP, Brasil",
+            },
+            {
+                "cnpj": "11111111000191",
+                "status": "skipped_low_precision",
+                "google_location_type": "APPROXIMATE",
+            },
+        ]
+        with patch(
+            "brcompany_api.domains.admin.router.admin_geocode_companies",
+            new_callable=AsyncMock,
+            return_value=mocked_results,
+        ) as mock_geo, patch(
+            "brcompany_api.domains.admin.router.invalidate_search_cache"
+        ) as mock_inv:
+            res_ok = await unit_client.post(
+                "/api/v1/admin/geo/geocode-companies",
+                json={"cnpjs": ["00.000.000/0001-91", "11111111000191"]},
+            )
+            assert res_ok.status_code == 200
+            body = res_ok.json()
+            assert body["requested"] == 2
+            assert body["updated"] == 1
+            assert body["skipped_low_precision"] == 1
+            assert body["results"][0]["precision"] == "exact_number"
+            mock_geo.assert_awaited_once()
+            mock_inv.assert_called_once()
+    finally:
+        app.dependency_overrides.pop(require_admin_user, None)
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_establishments_geo_batch_exact_and_mei_masking():
+    """Verify batch geo uses exact_number/street for non-MEI and masks MEI without caching centroid."""
+    from brcompany_api.domains.geo.service import resolve_establishments_geo_batch
+
+    fake_conn = AsyncMock()
+    establishments = [
+        {
+            "cnpj": "00000000000191",
+            "mei_optant": False,
+            "state": "SP",
+            "postal_code": "01310100",
+            "municipality_name": "SAO PAULO",
+            "street_type": "AVENIDA",
+            "street": "PAULISTA",
+            "number": "1000",
+        },
+        {
+            "cnpj": "99999999000191",
+            "mei_optant": True,
+            "state": "SP",
+            "postal_code": "01310100",
+            "municipality_name": "SAO PAULO",
+            "street_type": "AVENIDA",
+            "street": "PAULISTA",
+            "number": "1000",
+        },
+    ]
+
+    with patch("brcompany_api.domains.geo.service._lookup_company_cache", new_callable=AsyncMock, return_value={}), \
+         patch("brcompany_api.domains.geo.service.get_google_source_id", new_callable=AsyncMock, return_value=7), \
+         patch(
+             "brcompany_api.domains.geo.service._lookup_exact_number_by_cep_batch",
+             new_callable=AsyncMock,
+             return_value={("SP", "01310100", "1000"): (-23.5649, -46.6519, "google_geocoding")},
+         ), \
+         patch("brcompany_api.domains.geo.service._lookup_exact_number_by_street_batch", new_callable=AsyncMock, return_value={}), \
+         patch("brcompany_api.domains.geo.service._lookup_street_centroids_batch", new_callable=AsyncMock, return_value={}), \
+         patch(
+             "brcompany_api.domains.geo.service._lookup_postcode_centroids_batch",
+             new_callable=AsyncMock,
+             return_value={("SP", "01310100"): (-23.5620, -46.6550)},
+         ), \
+         patch("brcompany_api.domains.geo.service._save_company_cache_entries", new_callable=AsyncMock) as mock_save:
+        resolved = await resolve_establishments_geo_batch(fake_conn, establishments, mask_mei_exact=True)
+        assert resolved["00000000000191"]["precision"] == "exact_number"
+        assert resolved["00000000000191"]["source"] == "google_geocoding"
+        assert resolved["99999999000191"]["precision"] == "cep_centroid"
+        # Only non-MEI should be cached in company_geo_cache
+        saved_entries = mock_save.call_args.args[1]
+        assert len(saved_entries) == 1
+        assert saved_entries[0][0] == "00000000000191"
+
+
+
 
