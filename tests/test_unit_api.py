@@ -836,5 +836,118 @@ async def test_resolve_establishments_geo_batch_exact_and_mei_masking():
         assert saved_entries[0][0] == "00000000000191"
 
 
+@pytest.mark.asyncio
+async def test_fetch_establishments_for_geocoding_uses_singular_tables():
+    """Verify _fetch_establishments_for_geocoding queries singular establishment and municipality tables."""
+    from unittest.mock import MagicMock
+    from brcompany_api.domains.geo.google_geocoding import _fetch_establishments_for_geocoding
+
+    captured_sql = []
+
+    class _FakeCursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql, params=None):
+            captured_sql.append((sql, params))
+
+        async def fetchall(self):
+            return [
+                {
+                    "cnpj": "69559227000178",
+                    "street_type": "RUA",
+                    "street": "JOSE JOAQUIM DE SOUZA",
+                    "number": "98",
+                    "neighborhood": "MINGU",
+                    "postal_code": "34000568",
+                    "state": "MG",
+                    "municipality_name": "NOVA LIMA",
+                }
+            ]
+
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = _FakeCursor()
+
+    result = await _fetch_establishments_for_geocoding(fake_conn, ["69559227000178"])
+    assert "69559227000178" in result
+    sql, params = captured_sql[0]
+    assert "FROM establishment e" in sql
+    assert "LEFT JOIN municipality m" in sql
+    assert "establishments" not in sql
+    assert "municipalities" not in sql
+    assert params == {"cnpjs": ["69559227000178"]}
+
+
+@pytest.mark.asyncio
+async def test_admin_geocode_companies_commits_and_isolates_persistence_errors():
+    """Verify admin_geocode_companies commits each persisted item and rolls back failed items cleanly."""
+    from brcompany_api.domains.geo.google_geocoding import admin_geocode_companies
+
+    fake_conn = AsyncMock()
+    establishments = {
+        "69559227000178": {
+            "cnpj": "69559227000178",
+            "street_type": "RUA",
+            "street": "JOSE JOAQUIM DE SOUZA",
+            "number": "98",
+            "neighborhood": "MINGU",
+            "postal_code": "34000568",
+            "state": "MG",
+            "municipality_name": "NOVA LIMA",
+        },
+        "11111111000191": {
+            "cnpj": "11111111000191",
+            "street_type": "AVENIDA",
+            "street": "PAULISTA",
+            "number": "1000",
+            "neighborhood": "BELA VISTA",
+            "postal_code": "01310100",
+            "state": "SP",
+            "municipality_name": "SAO PAULO",
+        },
+    }
+
+    async def _fake_geocode(_client, _api_key, query_info):
+        return {
+            "status": "updated",
+            "latitude": -19.99,
+            "longitude": -43.85,
+            "precision": "exact_number",
+            "source": "google_geocoding",
+            "google_location_type": "ROOFTOP",
+            "formatted_address": query_info["query_address"],
+            "query_address": query_info["query_address"],
+        }
+
+    with patch(
+        "brcompany_api.domains.geo.google_geocoding._fetch_establishments_for_geocoding",
+        new_callable=AsyncMock,
+        return_value=establishments,
+    ), patch(
+        "brcompany_api.domains.geo.google_geocoding.geocode_address_google",
+        side_effect=_fake_geocode,
+    ), patch(
+        "brcompany_api.domains.geo.google_geocoding.persist_google_geocode_result",
+        new_callable=AsyncMock,
+        side_effect=[None, RuntimeError("db failure")],
+    ):
+        results = await admin_geocode_companies(
+            fake_conn,
+            ["69559227000178", "11111111000191"],
+            api_key="test-key",
+        )
+
+    assert len(results) == 2
+    assert results[0]["status"] == "updated"
+    assert results[1]["status"] == "error"
+    assert "Falha ao persistir na base geo" in results[1]["message"]
+    fake_conn.commit.assert_awaited_once()
+    fake_conn.rollback.assert_awaited_once()
+
+
+
 
 

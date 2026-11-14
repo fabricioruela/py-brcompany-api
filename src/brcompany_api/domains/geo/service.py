@@ -122,7 +122,9 @@ async def get_google_source_id(
             )
             created = await cur.fetchone()
             if created and created.get("source_id") is not None:
-                _cached_google_source_id = int(created["source_id"])
+                source_id = int(created["source_id"])
+                await conn.commit()
+                _cached_google_source_id = source_id
                 return _cached_google_source_id
     except Exception as exc:
         logger.debug("geo.sources google lookup skipped: %s", exc)
