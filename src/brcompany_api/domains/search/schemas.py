@@ -9,6 +9,23 @@ from brcompany_api.domains.company.schemas import COMPANY_SIZE_LABELS, IDENTIFIE
 from brcompany_api.utils.cnpj import format_cnpj
 
 
+class GeoRadiusFilter(BaseModel):
+    """Circular spatial filter centered at (latitude, longitude) with radius in km."""
+
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    radius_km: float = Field(default=3.0, ge=0.2, le=50.0)
+
+
+class GeoBoundsFilter(BaseModel):
+    """Rectangular map viewport bounds filter."""
+
+    north: float = Field(..., ge=-90.0, le=90.0)
+    south: float = Field(..., ge=-90.0, le=90.0)
+    east: float = Field(..., ge=-180.0, le=180.0)
+    west: float = Field(..., ge=-180.0, le=180.0)
+
+
 class SearchFilterRequest(BaseModel):
     """Granular B2B prospecting filters for PanoramaPJ."""
 
@@ -84,6 +101,14 @@ class SearchFilterRequest(BaseModel):
         default=False,
         description="Apenas empresas com e-mail cadastrado",
     )
+    geo_radius: Optional[GeoRadiusFilter] = Field(
+        default=None,
+        description="Filtro espacial circular (centro + raio em km)",
+    )
+    geo_bounds: Optional[GeoBoundsFilter] = Field(
+        default=None,
+        description="Filtro espacial por área retangular visível no mapa",
+    )
 
 
 class SearchCountResponse(BaseModel):
@@ -136,4 +161,24 @@ class SearchPreviewResponse(BaseModel):
     total_companies: int
     preview_count: int
     items: List[MaskedCompanyPreviewItem]
+    execution_time_ms: float
+
+
+class MapCompanyItem(MaskedCompanyPreviewItem):
+    latitude: float
+    longitude: float
+    geo_precision: str
+
+
+class MapCenterPoint(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class MapSearchResponse(BaseModel):
+    total_companies: int
+    mapped_count: int
+    limit: int
+    center: Optional[MapCenterPoint] = None
+    items: List[MapCompanyItem]
     execution_time_ms: float

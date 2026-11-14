@@ -5,6 +5,8 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from brcompany_api.utils.geo import BRAZIL_STATES as _BRAZIL_STATES_SET, normalize_place_name
+
 
 async def get_cnaes(
     conn: psycopg.AsyncConnection, q: Optional[str] = None, limit: int = 100
@@ -196,4 +198,110 @@ async def get_etl_status(conn: psycopg.AsyncConnection, schema: str) -> dict:
         "finished_at": run["finished_at"] if run else None,
         "total_companies": total_companies,
         "total_establishments": total_establishments,
+    }
+
+
+async def _lookup_nearest_geo_address(
+    conn: psycopg.AsyncConnection, latitude: float, longitude: float
+) -> Optional[dict]:
+    """Find nearest Brazilian address in geo.addresses using bounded PostGIS KNN search."""
+    states = sorted(_BRAZIL_STATES_SET)
+    queries = (
+        """
+        SELECT region, city
+        FROM geo.addresses
+        WHERE geom IS NOT NULL
+          AND region = ANY(%(states)s)
+          AND city IS NOT NULL
+          AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326), 0.5)
+        ORDER BY geom <-> ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326)
+        LIMIT 1;
+        """,
+        """
+        SELECT region, city
+        FROM geo.addresses
+        WHERE geom IS NOT NULL
+          AND region = ANY(%(states)s)
+          AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326), 1.5)
+        ORDER BY geom <-> ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326)
+        LIMIT 1;
+        """,
+    )
+    try:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            for query in queries:
+                await cur.execute(query, {"lat": latitude, "lon": longitude, "states": states})
+                row = await cur.fetchone()
+                if row:
+                    return row
+    except Exception:
+        try:
+            await conn.rollback()
+        except Exception:
+            pass
+    return None
+
+
+async def reverse_geocode_coordinates(
+    conn: psycopg.AsyncConnection, latitude: float, longitude: float
+) -> dict:
+    """Resolve browser coordinates via geo.addresses into RFB UF and 4-digit municipality_code."""
+    match = await _lookup_nearest_geo_address(conn, latitude, longitude)
+    if not match:
+        return {
+            "detected": False,
+            "state": None,
+            "municipality_code": None,
+            "municipality_name": None,
+            "source": "unavailable",
+        }
+
+    state = (match.get("region") or "").strip().upper()[:2]
+    if state not in _BRAZIL_STATES_SET:
+        return {
+            "detected": False,
+            "state": None,
+            "municipality_code": None,
+            "municipality_name": None,
+            "source": "unavailable",
+        }
+
+    city_name = match.get("city")
+    if city_name:
+        target_city = normalize_place_name(city_name)
+        if target_city:
+            try:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT municipality_code, MAX(municipality_name) AS municipality_name
+                        FROM location_hierarchy
+                        WHERE state = %(state)s
+                        GROUP BY municipality_code;
+                        """,
+                        {"state": state},
+                    )
+                    rows = await cur.fetchall()
+                for row in rows:
+                    m_name = row.get("municipality_name") or ""
+                    if normalize_place_name(m_name) == target_city:
+                        return {
+                            "detected": True,
+                            "state": state,
+                            "municipality_code": row["municipality_code"],
+                            "municipality_name": m_name,
+                            "source": "geo_addresses_city",
+                        }
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+
+    return {
+        "detected": True,
+        "state": state,
+        "municipality_code": None,
+        "municipality_name": None,
+        "source": "geo_addresses_state",
     }

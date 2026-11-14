@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from brcompany_api.config import Settings, get_settings
 from brcompany_api.db import get_db_conn
+from brcompany_api.domains.search.service import invalidate_search_cache
 from brcompany_api.utils.cnpj import clean_cnpj
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ async def request_opt_out(
             },
         )
     await conn.commit()
+    invalidate_search_cache()
     return OptOutResponse(
         cnpj=cleaned,
         status="active",

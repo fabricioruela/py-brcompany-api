@@ -20,8 +20,8 @@ from brcompany_api.domains.export.schemas import (
 )
 from brcompany_api.domains.search.service import (
     FALLBACK_SOURCE_SQL,
-    build_where_clause,
     is_search_index_populated,
+    resolve_effective_where_clause,
 )
 from brcompany_api.utils.spreadsheet import generate_csv_bytes, generate_xlsx_bytes
 
@@ -85,7 +85,22 @@ async def calculate_export_cost(
 
     use_index = await is_search_index_populated(conn)
     source_table = "company_search_index" if use_index else FALLBACK_SOURCE_SQL
-    where_sql, params = build_where_clause(req.filters, alias="csi", use_index_table=use_index)
+    where_sql, params = await resolve_effective_where_clause(
+        conn, req.filters, alias="csi", use_index_table=use_index
+    )
+    if where_sql == "FALSE":
+        return ExportCalculateResponse(
+            total_matching=0,
+            already_exported_in_search=0,
+            desired_quantity=desired,
+            exportable_quantity=0,
+            already_exported_included_free=0,
+            net_credits_required=0,
+            user_balance=user_balance,
+            has_sufficient_balance=True,
+            deduplication_enabled=dedup_enabled,
+            max_export_rows=max_rows,
+        )
     params["user_id"] = user_id
     params["desired"] = desired
 
@@ -192,7 +207,14 @@ async def execute_export_and_store_files(
 
     use_index = await is_search_index_populated(conn)
     source_table = "company_search_index" if use_index else FALLBACK_SOURCE_SQL
-    where_sql, params = build_where_clause(req.filters, alias="csi", use_index_table=use_index)
+    where_sql, params = await resolve_effective_where_clause(
+        conn, req.filters, alias="csi", use_index_table=use_index
+    )
+    if where_sql == "FALSE":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhuma empresa encontrada na área geográfica selecionada.",
+        )
     params["user_id"] = user_id
     params["desired"] = desired
 

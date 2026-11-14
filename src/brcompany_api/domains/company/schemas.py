@@ -52,6 +52,13 @@ class CnaeItem(BaseModel):
     description: Optional[str] = None
 
 
+class GeoCoordinate(BaseModel):
+    latitude: float
+    longitude: float
+    precision: str
+    source: str = "br_company.geo"
+
+
 class PartnerItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -109,6 +116,7 @@ class EstablishmentSummary(BaseModel):
     area_code_1: Optional[str] = None
     phone_1: Optional[str] = None
     email: Optional[str] = None
+    geo: Optional[GeoCoordinate] = None
 
     @computed_field
     @property
