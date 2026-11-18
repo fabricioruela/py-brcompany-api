@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8040
     app_log_level: str = "INFO"
+    app_log_format: str = "json"
 
     # PostgreSQL configuration
     app_database_url: str = "postgresql://br_company:br_company_secret@localhost:5433/br_company"
@@ -76,6 +77,12 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
     ]
+
+    @field_validator("app_log_format")
+    @classmethod
+    def normalize_log_format(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        return normalized if normalized in ("json", "console") else "json"
 
     @field_validator("app_cors_origins", "app_admin_emails", mode="before")
     @classmethod

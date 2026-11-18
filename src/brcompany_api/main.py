@@ -1,8 +1,10 @@
 """Main FastAPI application module for PanoramaPJ (py-brcompany-api)."""
 
+from typing import Optional
 from contextlib import asynccontextmanager
 import logging
 import time
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,19 +21,28 @@ from brcompany_api.domains.metadata.router import router as metadata_router
 from brcompany_api.domains.privacy.router import router as privacy_router
 from brcompany_api.domains.radars.router import router as radars_router
 from brcompany_api.domains.search.router import router as search_router
+from brcompany_api.domains.telemetry.router import router as telemetry_router
+from brcompany_api.logging_config import configure_logging, log_context, reset_user_context
 
 settings = get_settings()
 
-logging.basicConfig(
-    level=settings.app_log_level,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+configure_logging(
+    level_name=settings.app_log_level,
+    log_format=settings.app_log_format,
+    env_name=settings.app_env,
 )
 logger = logging.getLogger("brcompany_api")
+http_logger = logging.getLogger("brcompany_api.http")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown lifecycle for connection pools."""
+    configure_logging(
+        level_name=settings.app_log_level,
+        log_format=settings.app_log_format,
+        env_name=settings.app_env,
+    )
     logger.info("Starting up %s (%s)...", settings.app_name, settings.app_env)
     await init_db_pool(settings)
     yield
@@ -59,18 +70,77 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Process-Time-Ms", "X-Export-List-Id", "Content-Disposition"],
+    expose_headers=["X-Process-Time-Ms", "X-Export-List-Id", "X-Request-ID", "Content-Disposition"],
 )
+
+
+def _resolve_client_ip(request: Request) -> Optional[str]:
+    x_real_ip = request.headers.get("X-Real-IP")
+    if x_real_ip:
+        return x_real_ip.strip()
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else None
 
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """Add response time in milliseconds to response headers."""
+    """Bind request context, propagate X-Request-ID, and emit structured HTTP access logs."""
+    request_id = (request.headers.get("X-Request-ID") or "").strip() or uuid.uuid4().hex
+    client_ip = _resolve_client_ip(request)
     start_time = time.perf_counter()
-    response = await call_next(request)
-    process_time = (time.perf_counter() - start_time) * 1000
-    response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
-    return response
+
+    with log_context(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        user_id=None,
+        auth_method=None,
+        client_ip=client_ip,
+    ):
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            http_logger.exception(
+                "%s %s -> 500 (%.2fms)",
+                request.method,
+                request.url.path,
+                duration_ms,
+                extra={
+                    "fields": {
+                        "event": "http_request",
+                        "status_code": 500,
+                        "duration_ms": duration_ms,
+                        "query": request.url.query or None,
+                    }
+                },
+            )
+            reset_user_context()
+            raise
+
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        response.headers["X-Process-Time-Ms"] = f"{duration_ms:.2f}"
+        response.headers["X-Request-ID"] = request_id
+
+        fields = {
+            "event": "http_request",
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+            "query": request.url.query or None,
+        }
+        if request.url.path == "/health" and response.status_code < 400:
+            http_logger.debug("%s %s -> %d (%.2fms)", request.method, request.url.path, response.status_code, duration_ms, extra={"fields": fields})
+        elif response.status_code >= 500:
+            http_logger.error("%s %s -> %d (%.2fms)", request.method, request.url.path, response.status_code, duration_ms, extra={"fields": fields})
+        elif response.status_code >= 400:
+            http_logger.warning("%s %s -> %d (%.2fms)", request.method, request.url.path, response.status_code, duration_ms, extra={"fields": fields})
+        else:
+            http_logger.info("%s %s -> %d (%.2fms)", request.method, request.url.path, response.status_code, duration_ms, extra={"fields": fields})
+
+        reset_user_context()
+        return response
 
 
 @app.get(
@@ -102,6 +172,7 @@ app.include_router(radars_router, prefix="/api/v1")
 app.include_router(privacy_router, prefix="/api/v1")
 app.include_router(company_router, prefix="/api/v1")
 app.include_router(metadata_router, prefix="/api/v1")
+app.include_router(telemetry_router, prefix="/api/v1")
 
 
 def start():
@@ -112,6 +183,8 @@ def start():
         port=settings.app_port,
         reload=(settings.app_env == "development"),
         log_level=settings.app_log_level.lower(),
+        access_log=False,
+        log_config=None,
     )
 
 
