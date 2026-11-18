@@ -8,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from brcompany_api.db import get_db_conn
 from brcompany_api.domains.auth import service
+from brcompany_api.logging_config import set_user_context
 from brcompany_api.utils.security import decode_access_token
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -27,6 +28,7 @@ async def get_optional_user(
                 user = await service.get_user_profile_by_id(conn, user_id)
                 if user:
                     user["auth_method"] = "jwt"
+                    set_user_context(str(user["id"]), "jwt")
                     return user
             except Exception:
                 pass
@@ -35,6 +37,7 @@ async def get_optional_user(
         user = await service.get_user_by_api_key(conn, x_api_key.strip())
         if user:
             user["auth_method"] = "api_key"
+            set_user_context(str(user["id"]), "api_key")
             return user
 
     return None
