@@ -186,7 +186,7 @@ async def _fetch_establishments_for_geocoding(
                 m.description AS municipality_name
             FROM establishment e
             LEFT JOIN municipality m ON m.code = e.municipality_code
-            WHERE e.cnpj = ANY(%(cnpjs)s);
+            WHERE e.cnpj = ANY(%(cnpjs)s::bpchar[]);
             """,
             {"cnpjs": list(cnpjs)},
         )

@@ -295,7 +295,7 @@ async def execute_export_and_store_files(
                         ) AS partners_summary
                     FROM partner p
                     LEFT JOIN partner_qualification pq ON pq.code = p.qualification_code
-                    WHERE p.cnpj_base = ANY(%(bases)s)
+                    WHERE p.cnpj_base = ANY(%(bases)s::bpchar[])
                       AND p.partner_name IS NOT NULL
                     GROUP BY p.cnpj_base;
                     """,
