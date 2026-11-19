@@ -183,13 +183,13 @@ def build_where_clause(
         clean_states = [s.strip().upper()[:2] for s in filters.states if s.strip()]
         if clean_states:
             params["states"] = clean_states
-            clauses.append(f"{alias}.state = ANY(%(states)s)")
+            clauses.append(f"{alias}.state = ANY(%(states)s::bpchar[])")
 
     if filters.municipality_codes:
         clean_muns = [m.strip()[:4] for m in filters.municipality_codes if m.strip()]
         if clean_muns:
             params["municipality_codes"] = clean_muns
-            clauses.append(f"{alias}.municipality_code = ANY(%(municipality_codes)s)")
+            clauses.append(f"{alias}.municipality_code = ANY(%(municipality_codes)s::bpchar[])")
 
     if filters.neighborhoods:
         clean_neigh = [n.strip().upper() for n in filters.neighborhoods if n.strip()]
@@ -208,10 +208,10 @@ def build_where_clause(
             params["main_cnaes"] = clean_cnaes
             if filters.include_secondary_cnae:
                 clauses.append(
-                    f"({alias}.main_cnae = ANY(%(main_cnaes)s) OR {alias}.secondary_cnaes::text[] && %(main_cnaes)s::text[])"
+                    f"({alias}.main_cnae = ANY(%(main_cnaes)s::bpchar[]) OR {alias}.secondary_cnaes::text[] && %(main_cnaes)s::text[])"
                 )
             else:
-                clauses.append(f"{alias}.main_cnae = ANY(%(main_cnaes)s)")
+                clauses.append(f"{alias}.main_cnae = ANY(%(main_cnaes)s::bpchar[])")
 
     if filters.secondary_cnaes:
         clean_sec = [
@@ -228,7 +228,7 @@ def build_where_clause(
         clean_sizes = [s.strip()[:2] for s in filters.company_sizes if s.strip()]
         if clean_sizes:
             params["company_sizes"] = clean_sizes
-            clauses.append(f"{alias}.company_size = ANY(%(company_sizes)s)")
+            clauses.append(f"{alias}.company_size = ANY(%(company_sizes)s::bpchar[])")
 
     if filters.legal_nature_codes:
         clean_natures = [
@@ -239,7 +239,7 @@ def build_where_clause(
         clean_natures = [n for n in clean_natures if n]
         if clean_natures:
             params["legal_nature_codes"] = clean_natures
-            clauses.append(f"{alias}.legal_nature_code = ANY(%(legal_nature_codes)s)")
+            clauses.append(f"{alias}.legal_nature_code = ANY(%(legal_nature_codes)s::bpchar[])")
 
     if filters.identifier_type in ("1", "2"):
         params["identifier_type"] = filters.identifier_type
@@ -286,9 +286,9 @@ async def resolve_effective_where_clause(
     use_index_table: bool = True,
     spatial_targets: Optional[dict] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Build WHERE SQL including PostGIS-resolved CEP/municipality filters when spatial bounds/radius are set."""
+    """Build WHERE SQL including PostGIS-resolved CEP/municipality filters when spatial bounds/radius or viewport are set."""
     where_sql, params = build_where_clause(filters, alias=alias, use_index_table=use_index_table)
-    if filters.geo_radius is None and filters.geo_bounds is None:
+    if spatial_targets is None and filters.geo_radius is None and filters.geo_bounds is None:
         return where_sql, params
 
     spatial = (
@@ -308,13 +308,13 @@ async def resolve_effective_where_clause(
     extra_clauses: List[str] = []
     if spatial.get("states"):
         params["geo_states"] = spatial["states"]
-        extra_clauses.append(f"{alias}.state = ANY(%(geo_states)s)")
+        extra_clauses.append(f"{alias}.state = ANY(%(geo_states)s::bpchar[])")
     if spatial.get("municipality_codes"):
         params["geo_muni_codes"] = spatial["municipality_codes"]
-        extra_clauses.append(f"{alias}.municipality_code = ANY(%(geo_muni_codes)s)")
+        extra_clauses.append(f"{alias}.municipality_code = ANY(%(geo_muni_codes)s::bpchar[])")
     if spatial.get("postal_codes"):
         params["geo_postal_codes"] = spatial["postal_codes"]
-        extra_clauses.append(f"{alias}.postal_code = ANY(%(geo_postal_codes)s)")
+        extra_clauses.append(f"{alias}.postal_code = ANY(%(geo_postal_codes)s::bpchar[])")
 
     if not extra_clauses:
         return "FALSE", {}
@@ -411,8 +411,8 @@ async def _estimate_location_count(
                     """
                     SELECT COALESCE(SUM(active_count), 0)::bigint AS total
                     FROM location_hierarchy
-                    WHERE state = ANY(%(states)s)
-                      AND municipality_code = ANY(%(municipality_codes)s);
+                    WHERE state = ANY(%(states)s::bpchar[])
+                      AND municipality_code = ANY(%(municipality_codes)s::bpchar[]);
                     """,
                     {"states": states, "municipality_codes": municipality_codes},
                 )
@@ -421,7 +421,7 @@ async def _estimate_location_count(
                     """
                     SELECT COALESCE(SUM(active_count), 0)::bigint AS total
                     FROM location_hierarchy
-                    WHERE state = ANY(%(states)s);
+                    WHERE state = ANY(%(states)s::bpchar[]);
                     """,
                     {"states": states},
                 )
@@ -437,8 +437,8 @@ async def _estimate_location_count(
                     FROM app_saas.company_opt_outs oo
                     JOIN company_search_index csi ON csi.cnpj = oo.cnpj
                     WHERE oo.status = 'active'
-                      AND csi.state = ANY(%(states)s)
-                      AND csi.municipality_code = ANY(%(municipality_codes)s);
+                      AND csi.state = ANY(%(states)s::bpchar[])
+                      AND csi.municipality_code = ANY(%(municipality_codes)s::bpchar[]);
                     """,
                     {"states": states, "municipality_codes": municipality_codes},
                 )
@@ -449,7 +449,7 @@ async def _estimate_location_count(
                     FROM app_saas.company_opt_outs oo
                     JOIN company_search_index csi ON csi.cnpj = oo.cnpj
                     WHERE oo.status = 'active'
-                      AND csi.state = ANY(%(states)s);
+                      AND csi.state = ANY(%(states)s::bpchar[]);
                     """,
                     {"states": states},
                 )
@@ -471,8 +471,9 @@ async def count_matching_companies(
 ) -> int:
     """Count total active companies matching the provided filters."""
     use_index = await is_search_index_populated(conn)
+    has_active_spatial = bool(spatial_targets and spatial_targets.get("active"))
 
-    if use_index:
+    if use_index and not has_active_spatial:
         if is_unfiltered_search(filters):
             estimated = await _estimate_unfiltered_count(conn)
             if estimated is not None:
@@ -765,23 +766,18 @@ async def search_map_clusters(
     query = f"""
         SELECT
             csi.state,
-            LEFT(
-                COALESCE(NULLIF(regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g'), ''), ''),
-                %(prefix_len)s
-            ) AS cep_prefix,
+            LEFT(COALESCE(norm.cep, ''), %(prefix_len)s) AS cep_prefix,
             MIN(
                 CASE
-                    WHEN length(regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g')) = 8
-                         AND regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g') <> '00000000'
-                    THEN regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g')
+                    WHEN length(norm.cep) = 8 AND norm.cep <> '00000000'
+                    THEN norm.cep
                     ELSE NULL
                 END
             ) AS min_cep,
             MAX(
                 CASE
-                    WHEN length(regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g')) = 8
-                         AND regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g') <> '00000000'
-                    THEN regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g')
+                    WHEN length(norm.cep) = 8 AND norm.cep <> '00000000'
+                    THEN norm.cep
                     ELSE NULL
                 END
             ) AS max_cep,
@@ -789,6 +785,16 @@ async def search_map_clusters(
             MAX(NULLIF(TRIM(csi.neighborhood), '')) AS neighborhood,
             COUNT(*)::int AS company_count
         FROM {source_table} csi
+        CROSS JOIN LATERAL (
+            SELECT
+                CASE
+                    WHEN csi.postal_code IS NOT NULL
+                     AND length(csi.postal_code::text) = 8
+                     AND translate(csi.postal_code::text, '0123456789', '') = ''
+                    THEN csi.postal_code::text
+                    ELSE NULLIF(regexp_replace(COALESCE(csi.postal_code::text, ''), '\\D', '', 'g'), '')
+                END AS cep
+        ) norm
         WHERE {where_sql}
         GROUP BY 1, 2
         ORDER BY company_count DESC;
@@ -1137,7 +1143,7 @@ async def search_map_coordinate_groups(
                 csi.has_phone,
                 csi.has_email
             FROM {source_table} csi
-            WHERE csi.cnpj = ANY(%(cnpjs)s);
+            WHERE csi.cnpj = ANY(%(cnpjs)s::bpchar[]);
         """
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(detail_query, {"cnpjs": unique_small})
@@ -1221,9 +1227,7 @@ async def search_map_point_companies(
     clean_ceps = [c for c in clean_ceps if len(c) == 8]
     if clean_ceps:
         params["point_ceps"] = clean_ceps
-        extra_sql.append(
-            "regexp_replace(COALESCE(csi.postal_code, ''), '\\D', '', 'g') = ANY(%(point_ceps)s)"
-        )
+        extra_sql.append("csi.postal_code = ANY(%(point_ceps)s::bpchar[])")
 
     if q_point and q_point.strip():
         q_clean = q_point.strip()
@@ -1318,7 +1322,7 @@ async def search_map_point_companies(
             csi.has_phone,
             csi.has_email
         FROM {source_table} csi
-        WHERE csi.cnpj = ANY(%(page_cnpjs)s);
+        WHERE csi.cnpj = ANY(%(page_cnpjs)s::bpchar[]);
     """
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(detail_query, {"page_cnpjs": page_cnpjs})

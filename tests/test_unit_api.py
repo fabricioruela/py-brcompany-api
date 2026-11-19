@@ -236,9 +236,11 @@ def test_search_filter_where_clause_builder():
     )
     where_sql, params = build_where_clause(filters, alias="csi", use_index_table=True)
     assert "csi.search_text ILIKE %(q_like)s" in where_sql
-    assert "csi.state = ANY(%(states)s)" in where_sql
-    assert "csi.municipality_code = ANY(%(municipality_codes)s)" in where_sql
+    assert "csi.state = ANY(%(states)s::bpchar[])" in where_sql
+    assert "csi.municipality_code = ANY(%(municipality_codes)s::bpchar[])" in where_sql
+    assert "csi.main_cnae = ANY(%(main_cnaes)s::bpchar[])" in where_sql
     assert "csi.secondary_cnaes::text[] && %(main_cnaes)s::text[]" in where_sql
+    assert "csi.company_size = ANY(%(company_sizes)s::bpchar[])" in where_sql
     assert "csi.has_phone = true" in where_sql
     assert "csi.has_email = true" in where_sql
     assert "company_opt_outs" in where_sql
@@ -1114,6 +1116,77 @@ async def test_resolve_spatial_filter_targets_disjoint_viewport_returns_empty():
         viewport_bounds=GeoBoundsFilter(north=-22.8, south=-22.9, east=-43.1, west=-43.2),
     )
     assert res == {"active": True, "empty": True}
+
+
+@pytest.mark.asyncio
+async def test_viewport_spatial_targets_applied_in_where_and_count():
+    """Verify pre-resolved viewport spatial_targets are applied even without geo_radius/geo_bounds."""
+    from unittest.mock import MagicMock
+    from brcompany_api.domains.search.schemas import SearchFilterRequest
+    from brcompany_api.domains.search.service import (
+        count_matching_companies,
+        resolve_effective_where_clause,
+    )
+
+    filters = SearchFilterRequest(states=["MG"], municipality_codes=["4123"])
+    spatial_targets = {
+        "active": True,
+        "empty": False,
+        "states": ["MG"],
+        "municipality_codes": ["4123"],
+        "postal_codes": ["30112000", "30130010"],
+    }
+
+    fake_conn = AsyncMock()
+    where_sql, params = await resolve_effective_where_clause(
+        fake_conn,
+        filters,
+        alias="csi",
+        use_index_table=True,
+        spatial_targets=spatial_targets,
+    )
+    assert "csi.postal_code = ANY(%(geo_postal_codes)s::bpchar[])" in where_sql
+    assert "csi.state = ANY(%(geo_states)s::bpchar[])" in where_sql
+    assert "csi.municipality_code = ANY(%(geo_muni_codes)s::bpchar[])" in where_sql
+    assert params["geo_postal_codes"] == ["30112000", "30130010"]
+
+    captured = []
+
+    class _FakeCursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql, p=None):
+            captured.append((sql, p))
+
+        async def fetchone(self):
+            return {"total": 641}
+
+    count_conn = MagicMock()
+    count_conn.cursor.return_value = _FakeCursor()
+
+    with patch(
+        "brcompany_api.domains.search.service.is_search_index_populated",
+        new_callable=AsyncMock,
+        return_value=True,
+    ), patch(
+        "brcompany_api.domains.search.service._estimate_location_count",
+        new_callable=AsyncMock,
+        return_value=548716,
+    ) as mock_loc_est:
+        total = await count_matching_companies(
+            count_conn,
+            filters,
+            spatial_targets=spatial_targets,
+        )
+        assert total == 641
+        mock_loc_est.assert_not_awaited()
+        assert len(captured) == 1
+        assert "csi.postal_code = ANY(%(geo_postal_codes)s::bpchar[])" in captured[0][0]
+
 
 
 

@@ -143,7 +143,7 @@ async def _lookup_company_cache(
                 """
                 SELECT cnpj, latitude, longitude, precision, source
                 FROM app_saas.company_geo_cache
-                WHERE cnpj = ANY(%(cnpjs)s);
+                WHERE cnpj = ANY(%(cnpjs)s::bpchar[]);
                 """,
                 {"cnpjs": list(cnpjs)},
             )
@@ -1118,7 +1118,7 @@ async def _map_city_names_to_municipality_codes(
                 """
                 SELECT DISTINCT state, municipality_code, municipality_name
                 FROM location_hierarchy
-                WHERE state = ANY(%(states)s);
+                WHERE state = ANY(%(states)s::bpchar[]);
                 """,
                 {"states": sorted(by_state.keys())},
             )

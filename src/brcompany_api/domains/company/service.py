@@ -170,7 +170,7 @@ async def get_cnaes_descriptions(
     query = """
         SELECT code, description
         FROM cnae
-        WHERE code = ANY(%(codes)s)
+        WHERE code = ANY(%(codes)s::bpchar[])
         ORDER BY code ASC;
     """
     async with conn.cursor(row_factory=dict_row) as cur:
